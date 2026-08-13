@@ -1,4 +1,4 @@
-import math, torch, torch.nn.functional as F
+import math, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
@@ -43,6 +43,8 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+        self.use_ep = kwargs.get("use_ep", False)
+        self.ep_size = kwargs.get("ep_size", None)
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Model
@@ -66,10 +68,10 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
             rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
             rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0), rope_scaling.get("attention_factor", 1.0)
         )
-        if end / orig_max > 1.0:
-            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+        if end / orig_max > 1.0: # 向外扩展
+            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base)) # 计算“高频”和“低频”的维度分界线
             low, high = max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
-            ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
+            ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1) # 生成平滑过渡的斜坡（ramp）
             freqs = freqs * (1 - ramp + ramp / factor)
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
@@ -175,13 +177,260 @@ class MOEFeedForward(nn.Module):
             self.aux_loss = scores.new_zeros(1).squeeze()
         return y.view(batch_size, seq_len, hidden_dim)
 
+
+def _all_to_all_single(x, output_splits, input_splits, group):
+    """执行一次支持不等长 split 的 All-to-All。"""
+    output = x.new_empty((sum(output_splits), *x.shape[1:]))
+    dist.all_to_all_single(
+        output,
+        x.contiguous(),
+        output_split_sizes=list(output_splits),
+        input_split_sizes=list(input_splits),
+        group=group,
+    )
+    return output
+
+
+class _AllToAll(torch.autograd.Function):
+    """可求导 All-to-All：反向就是交换输入、输出 split 后再通信一次。"""
+
+    @staticmethod
+    def forward(ctx, x, output_splits, input_splits, group):
+        ctx.output_splits = tuple(output_splits)
+        ctx.input_splits = tuple(input_splits)
+        ctx.group = group
+        return _all_to_all_single(
+            x,
+            ctx.output_splits,
+            ctx.input_splits,
+            group,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = _all_to_all_single(
+            grad_output,
+            ctx.input_splits,
+            ctx.output_splits,
+            ctx.group,
+        )
+        return grad_input, None, None, None
+
+
+def differentiable_all_to_all(x, output_splits, input_splits, group):
+    return _AllToAll.apply(x, output_splits, input_splits, group)
+
+
+class ExpertParallelMOEFeedForward(nn.Module):
+    """支持训练与推理的 Top-K Expert Parallel MoE。"""
+
+    def __init__(self, config: MiniMindConfig, process_group=None):
+        super().__init__()
+        if not dist.is_available() or not dist.is_initialized():
+            raise RuntimeError(
+                "Expert Parallel requires torch.distributed to be initialized "
+                "before constructing the model"
+            )
+        if not 1 <= config.num_experts_per_tok <= config.num_experts:
+            raise ValueError(
+                "num_experts_per_tok must be between 1 and num_experts"
+            )
+
+        self.config = config
+        self.process_group = (
+            process_group if process_group is not None else dist.group.WORLD
+        )
+        self.ep_rank = dist.get_rank(self.process_group)
+        self.ep_size = dist.get_world_size(self.process_group)
+
+        if config.ep_size is not None and config.ep_size != self.ep_size:
+            raise ValueError(
+                f"config.ep_size={config.ep_size}, but process group size={self.ep_size}"
+            )
+        if config.num_experts % self.ep_size != 0:
+            raise ValueError(
+                f"num_experts={config.num_experts} must be divisible by "
+                f"ep_size={self.ep_size}"
+            )
+
+        self.experts_per_rank = config.num_experts // self.ep_size
+        self.first_expert_id = self.ep_rank * self.experts_per_rank
+        self.local_expert_ids = tuple(
+            range(
+                self.first_expert_id,
+                self.first_expert_id + self.experts_per_rank,
+            )
+        )
+
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        # Global IDs are used as keys so sharded state_dict names retain their
+        # global Expert identity (for example experts.2.* on rank 1).
+        self.experts = nn.ModuleDict({
+            str(global_id): FeedForward(
+                config,
+                intermediate_size=config.moe_intermediate_size,
+            )
+            for global_id in self.local_expert_ids
+        })
+        self.aux_loss = torch.tensor(0.0)
+
+    def forward(self, x):
+        batch_size, seq_len, hidden_dim = x.shape
+        x_flat = x.reshape(-1, hidden_dim)
+        num_tokens = x_flat.shape[0]
+
+        scores = F.softmax(self.gate(x_flat), dim=-1)
+        topk_weight, topk_expert_id = torch.topk(
+            scores,
+            k=self.config.num_experts_per_tok,
+            dim=-1,
+            sorted=False,
+        )
+        if self.config.norm_topk_prob:
+            topk_weight = topk_weight / (
+                topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            )
+
+        # Top-K turns every Token into K independent routing assignments.
+        # assignment_token_indices remembers which original Token each returned
+        # Expert output must be accumulated into.
+        assignment_token_indices = torch.arange(
+            num_tokens,
+            device=x_flat.device,
+        )[:, None].expand(-1, self.config.num_experts_per_tok).reshape(-1)
+        assignment_weight = topk_weight.reshape(-1)
+        global_expert_id = topk_expert_id.reshape(-1)
+        assignment_x = x_flat[assignment_token_indices]
+        num_assignments = assignment_x.shape[0]
+
+        target_rank = global_expert_id // self.experts_per_rank
+        local_expert_id = global_expert_id % self.experts_per_rank
+
+        rank_sort_indices = torch.argsort(target_rank, stable=True)
+        send_x = assignment_x[rank_sort_indices]
+        send_local_expert_id = local_expert_id[rank_sort_indices]
+
+        send_counts = torch.bincount(
+            target_rank,
+            minlength=self.ep_size,
+        )
+        recv_counts = torch.empty_like(send_counts)
+        dist.all_to_all_single(
+            recv_counts,
+            send_counts,
+            group=self.process_group,
+        )
+        send_splits = send_counts.tolist()
+        recv_splits = recv_counts.tolist()
+
+        # dispatch：把 Token 发送到持有目标 Expert 的 rank。该通信参与 autograd，
+        # backward 会执行反向 All-to-All，把输入梯度送回 Token 的来源 rank。
+        recv_x = differentiable_all_to_all(
+            send_x,
+            recv_splits,
+            send_splits,
+            self.process_group,
+        )
+        recv_local_expert_id = torch.empty(
+            sum(recv_splits),
+            dtype=send_local_expert_id.dtype,
+            device=send_local_expert_id.device,
+        )
+        dist.all_to_all_single(
+            recv_local_expert_id,
+            send_local_expert_id.contiguous(),
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
+            group=self.process_group,
+        )
+
+        expert_sort_indices = torch.argsort(
+            recv_local_expert_id,
+            stable=True,
+        )
+        expert_sorted_x = recv_x[expert_sort_indices]
+        local_expert_counts = torch.bincount(
+            recv_local_expert_id,
+            minlength=self.experts_per_rank,
+        ).tolist()
+
+        expert_outputs = []
+        offset = 0
+        for local_id, count in enumerate(local_expert_counts):
+            end = offset + count
+            if count > 0:
+                global_id = self.first_expert_id + local_id
+                expert_outputs.append(
+                    self.experts[str(global_id)](expert_sorted_x[offset:end])
+                )
+            offset = end
+
+        if expert_outputs:
+            expert_sorted_output = torch.cat(expert_outputs, dim=0)
+        else:
+            # Keep a correctly shaped empty output when this rank receives no Token.
+            expert_sorted_output = expert_sorted_x.clone()
+
+        inverse_expert_indices = torch.empty_like(expert_sort_indices)
+        inverse_expert_indices[expert_sort_indices] = torch.arange(
+            expert_sort_indices.numel(),
+            device=expert_sort_indices.device,
+        )
+        recv_order_output = expert_sorted_output[inverse_expert_indices]
+
+        # combine：把 Expert 输出送回 Token 来源 rank。它的 backward 同样是
+        # 一次方向相反的 All-to-All，把输出梯度送回 Expert 所在 rank。
+        returned_sorted_output = differentiable_all_to_all(
+            recv_order_output,
+            send_splits,
+            recv_splits,
+            self.process_group,
+        )
+        inverse_rank_indices = torch.empty_like(rank_sort_indices)
+        inverse_rank_indices[rank_sort_indices] = torch.arange(
+            num_assignments,
+            device=rank_sort_indices.device,
+        )
+        returned_assignment_output = returned_sorted_output[inverse_rank_indices]
+        weighted_assignment_output = (
+            returned_assignment_output * assignment_weight[:, None]
+        ).to(x_flat.dtype)
+        y_flat = torch.zeros_like(x_flat)
+        y_flat.index_add_(
+            0,
+            assignment_token_indices,
+            weighted_assignment_output,
+        )
+
+        if self.training and self.config.router_aux_loss_coef > 0:
+            # top-k 选择本身不可导；负载统计只作为 gate 概率的平衡目标。
+            load = F.one_hot(
+                topk_expert_id,
+                self.config.num_experts,
+            ).float().mean(dim=(0, 1))
+            if self.ep_size > 1:
+                dist.all_reduce(load, op=dist.ReduceOp.SUM, group=self.process_group)
+                load.div_(self.ep_size)
+            self.aux_loss = (
+                load * scores.mean(dim=0)
+            ).sum() * self.config.num_experts * self.config.router_aux_loss_coef
+        else:
+            self.aux_loss = scores.new_zeros(())
+
+        return y_flat.reshape(batch_size, seq_len, hidden_dim)
+
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
         self.self_attn = Attention(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        if not config.use_moe:
+            self.mlp = FeedForward(config)
+        elif config.use_ep:
+            self.mlp = ExpertParallelMOEFeedForward(config)
+        else:
+            self.mlp = MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         residual = hidden_states
@@ -228,7 +477,11 @@ class MiniMindModel(nn.Module):
             )
             presents.append(present)
         hidden_states = self.norm(hidden_states)
-        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
+        aux_loss = sum([
+            l.mlp.aux_loss
+            for l in self.layers
+            if isinstance(l.mlp, (MOEFeedForward, ExpertParallelMOEFeedForward))
+        ], hidden_states.new_zeros(1).squeeze())
         return hidden_states, presents, aux_loss
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):

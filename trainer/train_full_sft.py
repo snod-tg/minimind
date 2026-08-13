@@ -16,7 +16,11 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import SFTDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.trainer_utils import (
+    get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode,
+    setup_seed, init_model, SkipBatchSampler, sync_ep_gradients,
+    clip_ep_grad_norm_
+)
 
 warnings.filterwarnings('ignore')
 
@@ -40,8 +44,13 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0:
+            if lm_config.use_ep:
+                sync_ep_gradients(model)
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            if lm_config.use_ep:
+                clip_ep_grad_norm_(model, args.grad_clip)
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             scaler.step(optimizer)
             scaler.update()
@@ -58,24 +67,44 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+        should_save = step % args.save_interval == 0 or step == iters
+        if should_save and (lm_config.use_ep or is_main_process()):
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, '_orig_mod', raw_model)
-            state_dict = raw_model.state_dict()
-            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
-                         epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
+            if lm_config.use_ep:
+                lm_checkpoint(
+                    lm_config,
+                    weight=args.save_weight,
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    step=step,
+                    wandb=wandb,
+                    save_dir='../checkpoints',
+                    scaler=scaler,
+                    export_path=ckp,
+                )
+            else:
+                raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+                raw_model = getattr(raw_model, '_orig_mod', raw_model)
+                state_dict = raw_model.state_dict()
+                torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
+                lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer,
+                             epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
+                del state_dict
             model.train()
-            del state_dict
 
         del input_ids, labels, res, loss
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:
+        if lm_config.use_ep:
+            sync_ep_gradients(model)
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        if lm_config.use_ep:
+            clip_ep_grad_norm_(model, args.grad_clip)
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
@@ -99,6 +128,9 @@ if __name__ == "__main__":
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=768, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument('--use_ep', action='store_true', help="启用可训练Expert Parallel；会自动启用MoE，必须使用torchrun启动")
+    parser.add_argument('--num_experts', default=4, type=int, help="全局Expert数量")
+    parser.add_argument('--num_experts_per_tok', default=1, type=int, help="每个Token选择的Expert数量（Top-K）")
     parser.add_argument("--data_path", type=str, default="../dataset/sft_t2t_mini.jsonl", help="训练数据路径")
     parser.add_argument('--from_weight', default='pretrain', type=str, help="基于哪个权重训练，为none则不基于任何权重训练")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
@@ -110,11 +142,27 @@ if __name__ == "__main__":
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    if args.use_ep:
+        if not dist.is_initialized() or dist.get_world_size() < 2:
+            raise RuntimeError('--use_ep训练必须用torchrun启动，并且world_size至少为2')
+        if args.num_experts % dist.get_world_size() != 0:
+            raise ValueError('num_experts必须能被EP world_size整除')
+        if args.use_compile == 1:
+            raise ValueError('当前动态All-to-All EP暂不支持--use_compile 1')
+        args.use_moe = 1
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
+    lm_config = MiniMindConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        use_moe=bool(args.use_moe),
+        use_ep=args.use_ep,
+        ep_size=dist.get_world_size() if args.use_ep else None,
+        num_experts=args.num_experts,
+        num_experts_per_tok=args.num_experts_per_tok,
+    )
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
@@ -151,7 +199,7 @@ if __name__ == "__main__":
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
-    if dist.is_initialized():
+    if dist.is_initialized() and not lm_config.use_ep:
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
     # ========== 8. 开始训练 ==========

@@ -20,11 +20,24 @@ def get_model_params(model, config):
     n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
     n_active = getattr(config, 'num_experts_per_tok', 0)
     n_shared = getattr(config, 'n_shared_experts', 0)
-    expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.experts.0.' in n) / 1e6
+    local_expert_ids = {
+        n.split('.mlp.experts.', 1)[1].split('.', 1)[0]
+        for n, _ in model.named_parameters()
+        if '.mlp.experts.' in n
+    }
+    local_expert_total = sum(
+        p.numel()
+        for n, p in model.named_parameters()
+        if '.mlp.experts.' in n
+    ) / 1e6
+    expert = local_expert_total / max(len(local_expert_ids), 1)
     shared_expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.shared_experts.0.' in n) / 1e6
-    base = total - (expert * n_routed) - (shared_expert * n_shared)
+    base = total - local_expert_total - (shared_expert * n_shared)
     active = base + (expert * n_active) + (shared_expert * n_shared)
-    if active < total: Logger(f'Model Params: {total:.2f}M-A{active:.2f}M')
+    if getattr(config, 'use_ep', False):
+        global_total = base + (expert * n_routed) + (shared_expert * n_shared)
+        Logger(f'Model Params/rank: {total:.2f}M-Global{global_total:.2f}M-Active{active:.2f}M')
+    elif active < total: Logger(f'Model Params: {total:.2f}M-A{active:.2f}M')
     else: Logger(f'Model Params: {total:.2f}M')
 
 
@@ -51,6 +64,64 @@ def init_distributed_mode():
     return local_rank
 
 
+def is_ep_expert_parameter(name):
+    return '.mlp.experts.' in name
+
+
+@torch.no_grad()
+def sync_ep_shared_parameters(model, group=None):
+    """让所有 EP rank 的共享参数从 rank 0 获得完全相同的初值。"""
+    if not getattr(model.config, 'use_ep', False):
+        return
+    group = group if group is not None else dist.group.WORLD
+    for name, param in model.named_parameters():
+        if not is_ep_expert_parameter(name):
+            dist.broadcast(param.data, src=0, group=group)
+
+
+@torch.no_grad()
+def sync_ep_gradients(model, group=None):
+    """同步共享参数梯度，并对只在本 rank 保存的 Expert 梯度做全局平均。"""
+    if not getattr(model.config, 'use_ep', False):
+        return
+    group = group if group is not None else dist.group.WORLD
+    world_size = dist.get_world_size(group)
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        if is_ep_expert_parameter(name):
+            # 每个本地 Expert 已经通过 dispatch 收到了所有 rank 的 Token，
+            # 参数梯度是各 rank loss 梯度之和，只需除以 EP world size。
+            param.grad.div_(world_size)
+        else:
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=group)
+            param.grad.div_(world_size)
+
+
+@torch.no_grad()
+def clip_ep_grad_norm_(model, max_norm, group=None):
+    """计算去重后的全局 EP 梯度范数，并在所有 rank 使用同一缩放系数。"""
+    group = group if group is not None else dist.group.WORLD
+    world_size = dist.get_world_size(group)
+    device = next(model.parameters()).device
+    local_squared_norm = torch.zeros((), dtype=torch.float32, device=device)
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        squared_norm = param.grad.detach().float().pow(2).sum()
+        # 共享梯度在每个 rank 都相同，求全局范数时只计算一份。
+        if not is_ep_expert_parameter(name):
+            squared_norm.div_(world_size)
+        local_squared_norm.add_(squared_norm)
+    dist.all_reduce(local_squared_norm, op=dist.ReduceOp.SUM, group=group)
+    total_norm = local_squared_norm.sqrt()
+    clip_coef = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
+    for param in model.parameters():
+        if param.grad is not None:
+            param.grad.mul_(clip_coef)
+    return total_norm
+
+
 def setup_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -71,6 +142,59 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         raw_model = getattr(raw_model, '_orig_mod', raw_model)
         state_dict = raw_model.state_dict()
         state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
+        if lm_config.use_ep:
+            if not dist.is_initialized():
+                raise RuntimeError('EP checkpoint requires torch.distributed')
+            rank, world_size = dist.get_rank(), dist.get_world_size()
+            local_expert_state = {
+                key: value
+                for key, value in state_dict.items()
+                if is_ep_expert_parameter(key)
+            }
+            gathered_expert_states = [None] * world_size if rank == 0 else None
+            dist.gather_object(
+                local_expert_state,
+                gathered_expert_states,
+                dst=0,
+            )
+
+            export_path = kwargs.pop('export_path', None)
+            if rank == 0:
+                full_state_dict = dict(state_dict)
+                for expert_state in gathered_expert_states:
+                    full_state_dict.update(expert_state)
+                for path in (ckp_path, export_path):
+                    if path:
+                        os.makedirs(os.path.dirname(path), exist_ok=True)
+                        tmp_path = path + '.tmp'
+                        torch.save(full_state_dict, tmp_path)
+                        os.replace(tmp_path, path)
+                del full_state_dict
+
+            wandb_id = getattr(wandb, 'id', None) if wandb else None
+            rank_resume_path = resume_path.replace(
+                '_resume.pth',
+                f'_ep_rank{rank}_resume.pth',
+            )
+            resume_data = {
+                'model': state_dict,
+                'optimizer': optimizer.state_dict(),
+                'epoch': epoch,
+                'step': step,
+                'world_size': world_size,
+                'wandb_id': wandb_id,
+            }
+            for key, value in kwargs.items():
+                if value is not None:
+                    resume_data[key] = value.state_dict() if hasattr(value, 'state_dict') else value
+            rank_resume_tmp = rank_resume_path + '.tmp'
+            torch.save(resume_data, rank_resume_tmp)
+            os.replace(rank_resume_tmp, rank_resume_path)
+            dist.barrier()
+            del state_dict, resume_data, local_expert_state
+            torch.cuda.empty_cache()
+            return
+
         ckp_tmp = ckp_path + '.tmp'
         torch.save(state_dict, ckp_tmp)
         os.replace(ckp_tmp, ckp_path)
@@ -105,6 +229,24 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         del state_dict, resume_data
         torch.cuda.empty_cache()
     else:  # 加载模式
+        if lm_config.use_ep:
+            if not dist.is_initialized():
+                raise RuntimeError('EP resume requires torch.distributed')
+            rank = dist.get_rank()
+            rank_resume_path = resume_path.replace(
+                '_resume.pth',
+                f'_ep_rank{rank}_resume.pth',
+            )
+            if not os.path.exists(rank_resume_path):
+                return None
+            ckp_data = torch.load(rank_resume_path, map_location='cpu')
+            saved_ws = ckp_data.get('world_size', 1)
+            current_ws = dist.get_world_size()
+            if saved_ws != current_ws:
+                raise RuntimeError(
+                    f'EP resume要求相同world_size，checkpoint={saved_ws}, current={current_ws}'
+                )
+            return ckp_data
         if os.path.exists(resume_path):
             ckp_data = torch.load(resume_path, map_location='cpu')
             saved_ws = ckp_data.get('world_size', 1)
@@ -123,12 +265,29 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
     if from_weight!= 'none':
         moe_suffix = '_moe' if lm_config.use_moe else ''
         weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-        weights = torch.load(weight_path, map_location=device)
-        model.load_state_dict(weights, strict=False)
+        weights = torch.load(weight_path, map_location='cpu')
+        if lm_config.use_ep:
+            local_keys = set(model.state_dict().keys())
+            weights = {
+                key: value
+                for key, value in weights.items()
+                if key in local_keys
+            }
+            missing_keys = local_keys - set(weights.keys())
+            if missing_keys:
+                raise RuntimeError(
+                    f'checkpoint缺少当前EP rank需要的参数: {sorted(missing_keys)[:5]}'
+                )
+            model.load_state_dict(weights, strict=True)
+        else:
+            model.load_state_dict(weights, strict=False)
 
     get_model_params(model, lm_config)
     Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
-    return model.to(device), tokenizer
+    model = model.to(device)
+    if lm_config.use_ep:
+        sync_ep_shared_parameters(model)
+    return model, tokenizer
 
 
 class SkipBatchSampler(Sampler):
