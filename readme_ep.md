@@ -61,21 +61,119 @@ global_expert_id = rank * experts_per_rank + local_expert_id
 
 完整数据流如下：
 
-```mermaid
-flowchart LR
-    A[输入 Token] --> B[全局 Router]
-    B --> C[Top-K Expert ID 与权重]
-    C --> D[计算 target_rank 和 local_expert_id]
-    D --> E[按 target_rank 排序]
-    E --> F[动态不等长 All-to-All Dispatch]
-    F --> G[目标 Rank 按 local_expert_id 再排序]
-    G --> H[本地 Expert 批量计算]
-    H --> I[撤销 Expert 内排序]
-    I --> J[All-to-All Combine 返回来源 Rank]
-    J --> K[撤销 Rank 排序]
-    K --> L[乘 Router 权重并按 Token 累加]
-    L --> M[恢复 batch、sequence 形状]
+```text
++--------------------------------------------------------------------------+
+| 1. SOURCE RANK: Router                                                   |
++--------------------------------------------------------------------------+
+| x [batch, seq_len, hidden_size]                                          |
+|             |                                                            |
+|             v  reshape                                                   |
+| x_flat [num_tokens, hidden_size]                                         |
+|             |                                                            |
+|             v  global Router + softmax + top-k                           |
+| topk_expert_id [num_tokens, top_k]                                       |
+| topk_weight    [num_tokens, top_k]                                       |
+|             |                                                            |
+|             v  expand each Token into top_k assignments                  |
+| assignment_x / global_expert_id / assignment_weight                      |
++------------------------------------+-------------------------------------+
+                                     |
+                                     v
++--------------------------------------------------------------------------+
+| 2. SOURCE RANK: Prepare Dispatch                                         |
++--------------------------------------------------------------------------+
+| global_expert_id                                                         |
+|        |                                                                 |
+|        +--> target_rank    = global_expert_id // experts_per_rank        |
+|        +--> local_expert_id = global_expert_id %  experts_per_rank       |
+|                                                                          |
+| stable argsort(target_rank)                                              |
+|        |                                                                 |
+|        +--> send_x:               [to Rank 0][to Rank 1] ...             |
+|        +--> send_local_expert_id: [to Rank 0][to Rank 1] ...             |
+|        +--> keep rank_sort_indices on the source Rank                    |
+|                                                                          |
+| bincount(target_rank) -> send_splits                                     |
+| exchange send_counts    -> recv_splits                                   |
++------------------------------------+-------------------------------------+
+                                     |
+                                     v
++--------------------------------------------------------------------------+
+| 3. DISPATCH: Dynamic Uneven All-to-All                                   |
++--------------------------------------------------------------------------+
+|                                                                          |
+|  Rank 0 send buffer                         Rank 1 send buffer            |
+|  +--------------+--------------+            +--------------+-----------+ |
+|  | for Rank 0   | for Rank 1   |            | for Rank 0   | for Rank 1| |
+|  +------+-------+------+-------+            +------+-------+------+----+ |
+|         |              |                           |              |       |
+|         +--------------+------ All-to-All ---------+--------------+       |
+|                        |                                                 |
+|              +---------+-------------------+                             |
+|              v                             v                             |
+|  Rank 0 receives Tokens for E0/E1   Rank 1 receives Tokens for E2/E3     |
+|                                                                          |
+|  hidden states: differentiable_all_to_all                               |
+|  local Expert IDs: ordinary dist.all_to_all_single                      |
++------------------------------------+-------------------------------------+
+                                     |
+                                     v
++--------------------------------------------------------------------------+
+| 4. TARGET RANK: Local Expert Computation                                 |
++--------------------------------------------------------------------------+
+| recv_x + recv_local_expert_id                                            |
+|             |                                                            |
+|             v  stable argsort(local_expert_id)                           |
+| expert_sorted_x: [Expert 0 Tokens][Expert 1 Tokens] ...                  |
+|             |                                                            |
+|             +--> local Expert 0 --> output 0                             |
+|             +--> local Expert 1 --> output 1                             |
+|             +--> ...                                                     |
+|             |                                                            |
+|             v  concatenate Expert outputs                               |
+| expert_sorted_output                                                     |
+|             |                                                            |
+|             v  inverse_expert_indices                                    |
+| recv_order_output: restore the order received from source Ranks          |
++------------------------------------+-------------------------------------+
+                                     |
+                                     v
++--------------------------------------------------------------------------+
+| 5. COMBINE: Dynamic Uneven All-to-All                                    |
++--------------------------------------------------------------------------+
+| Expert outputs are sent back to the Rank where each Token originated     |
+|                                                                          |
+| recv_order_output                                                        |
+|             |                                                            |
+|             v  differentiable_all_to_all (reverse direction)            |
+| returned_sorted_output                                                   |
++------------------------------------+-------------------------------------+
+                                     |
+                                     v
++--------------------------------------------------------------------------+
+| 6. SOURCE RANK: Restore and Merge                                        |
++--------------------------------------------------------------------------+
+| returned_sorted_output                                                   |
+|             |                                                            |
+|             v  inverse_rank_indices                                      |
+| returned_assignment_output: restore original assignment order           |
+|             |                                                            |
+|             v  multiply assignment_weight                               |
+| weighted_assignment_output                                               |
+|             |                                                            |
+|             v  index_add by assignment_token_indices                     |
+| y_flat [num_tokens, hidden_size]                                         |
+|             |                                                            |
+|             v  reshape                                                   |
+| y [batch, seq_len, hidden_size]                                          |
++--------------------------------------------------------------------------+
 ```
+
+需要始终保留的三类索引分别是：
+
+- `assignment_token_indices`：Top-K 的每条 assignment 属于哪个原始 Token。
+- `inverse_expert_indices`：撤销目标 Rank 内按 `local_expert_id` 进行的排序。
+- `inverse_rank_indices`：撤销来源 Rank 内按 `target_rank` 进行的排序。
 
 ## 4. 我修改了哪些文件
 
