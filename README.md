@@ -1,3 +1,5 @@
+> 🚀 **[查看 Expert Parallel（EP）实现说明：设计、训练、推理与验证结果](./readme_ep.md)**
+
 <div align="center">
 
 ![logo](./images/logo.png)
