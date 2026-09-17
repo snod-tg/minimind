@@ -1,4 +1,4 @@
-"""Run with: torchrun --standalone --nproc_per_node=4 tests/test_dp_ep.py"""
+"""Run with two or four torchrun processes; set DP_EP_TEST_DEVICE=cuda for NCCL."""
 import os
 import sys
 
@@ -15,9 +15,14 @@ from trainer.trainer_utils import (
 
 
 def main():
-    dist.init_process_group('gloo')
+    use_cuda = os.environ.get('DP_EP_TEST_DEVICE') == 'cuda'
+    dist.init_process_group('nccl' if use_cuda else 'gloo')
+    if use_cuda:
+        torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
+    device = torch.device('cuda' if use_cuda else 'cpu')
     rank = dist.get_rank()
-    assert dist.get_world_size() == 4
+    world_size = dist.get_world_size()
+    assert world_size in (2, 4)
     ep_size = int(os.environ.get('EP_TEST_SIZE', '2'))
     parallel = init_ep_dp_groups(ep_size, 4)
     assert (parallel.ep_rank, parallel.dp_rank) == (rank % ep_size, rank // ep_size)
@@ -31,14 +36,14 @@ def main():
         ep_size=ep_size, num_experts=4, num_experts_per_tok=2,
         flash_attn=False,
     )
-    model = MiniMindForCausalLM(config, ep_group=parallel.ep_group)
+    model = MiniMindForCausalLM(config, ep_group=parallel.ep_group).to(device)
     sync_ep_shared_parameters(model, parallel)
     experts_per_rank = 4 // ep_size
     assert model.model.layers[0].mlp.local_expert_ids == tuple(
         range(parallel.ep_rank * experts_per_rank,
               (parallel.ep_rank + 1) * experts_per_rank)
     )
-    ids = (torch.arange(12).reshape(2, 6) + rank * 7) % 64
+    ids = (torch.arange(12, device=device).reshape(2, 6) + rank * 7) % 64
     result = model(ids, labels=ids)
     (result.loss + result.aux_loss).backward()
     sync_ep_gradients(model, parallel)
@@ -61,7 +66,7 @@ def main():
     lm_checkpoint(config, weight='test', model=model, optimizer=optimizer,
                   save_dir=path, parallel=parallel)
     resume = lm_checkpoint(config, weight='test', save_dir=path, parallel=parallel)
-    assert resume['ep_size'] == ep_size and resume['dp_size'] == 4 // ep_size
+    assert resume['ep_size'] == ep_size and resume['dp_size'] == world_size // ep_size
     assert resume['rank'] == rank
     if rank == 0:
         full = torch.load(os.path.join(path, 'test_32_moe.pth'), map_location='cpu', weights_only=True)

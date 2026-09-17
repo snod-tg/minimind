@@ -623,11 +623,23 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun \
   --use_compile 0
 ```
 
-### 11.5 四卡 DP × EP 预训练
+### 11.5 双卡数据分片 + EP
+
+现有双卡 EP 训练已经包含数据并行的数据处理方式：两张卡通过全局
+`DistributedSampler` 读取不同样本；共享的 Attention、Router、Embedding 等参数
+在两卡上复制并同步梯度。每张卡只保存部分 Expert，Router 选中的 Token 经
+All-to-All 发到 Expert 所在卡，计算后再发回原卡继续后续层与 loss 计算。
+
+因此 `--use_ep --ep_size 2` 在两卡上就能运行上述流程；省略 `--ep_size`
+时也相同。此时独立的 **EP 副本数**为 1，即二维分组记法中的 `DP=1、EP=2`。
+这里的 `DP=1` 只表示没有第二套完整 Expert 分片副本，并不表示两卡读取相同数据。
+
+### 11.6 四卡独立副本 DP × EP 预训练
 
 `WORLD_SIZE=4`、`ep_size=2` 时，Rank 0–1 和 2–3 分别组成一个 EP 副本；
 Rank 0/2、1/3 分别同步相同的 Expert shard。每张卡仍由全局
-`DistributedSampler` 读取不同样本。省略 `--ep_size` 时保持原有纯 EP 行为。
+`DistributedSampler` 读取不同样本。四卡配置在双卡流程之外，额外复制一套
+Expert 分片，并在相同 Expert 的两个副本之间同步梯度。
 
 ```bash
 cd trainer
