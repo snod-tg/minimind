@@ -7,6 +7,7 @@ __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import random
 import math
+from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -68,41 +69,94 @@ def is_ep_expert_parameter(name):
     return '.mlp.experts.' in name
 
 
-@torch.no_grad()
-def sync_ep_shared_parameters(model, group=None):
-    """让所有 EP rank 的共享参数从 rank 0 获得完全相同的初值。"""
-    if not getattr(model.config, 'use_ep', False):
-        return
-    group = group if group is not None else dist.group.WORLD
-    for name, param in model.named_parameters():
-        if not is_ep_expert_parameter(name):
-            dist.broadcast(param.data, src=0, group=group)
+@dataclass(frozen=True)
+class ParallelGroups:
+    ep_group: object
+    dp_group: object
+    ep_rank: int
+    dp_rank: int
+    ep_size: int
+    dp_size: int
+
+
+def init_ep_dp_groups(ep_size, num_experts):
+    if not dist.is_initialized() or dist.get_world_size() < 2:
+        raise RuntimeError('EP训练必须使用至少两个torchrun进程')
+    world_size = dist.get_world_size()
+    if ep_size is None:
+        ep_size = world_size
+    if ep_size < 2 or world_size % ep_size:
+        raise ValueError('ep_size必须至少为2，且能整除WORLD_SIZE')
+    if num_experts % ep_size:
+        raise ValueError('num_experts必须能被ep_size整除')
+    rank = dist.get_rank()
+    dp_size = world_size // ep_size
+    ep_rank, dp_rank = rank % ep_size, rank // ep_size
+    ep_group = dp_group = None
+    # All ranks must create groups in the same order, including non-members.
+    for dp in range(dp_size):
+        group = dist.new_group(ranks=list(range(dp * ep_size, (dp + 1) * ep_size)))
+        if dp == dp_rank:
+            ep_group = group
+    for ep in range(ep_size):
+        group = dist.new_group(ranks=[dp * ep_size + ep for dp in range(dp_size)])
+        if ep == ep_rank:
+            dp_group = group
+    return ParallelGroups(ep_group, dp_group, ep_rank, dp_rank, ep_size, dp_size)
 
 
 @torch.no_grad()
-def sync_ep_gradients(model, group=None):
-    """同步共享参数梯度，并对只在本 rank 保存的 Expert 梯度做全局平均。"""
+def sync_ep_shared_parameters(model, parallel=None):
+    """共享参数全局一致，同一 Expert shard 在各 DP 副本一致。"""
     if not getattr(model.config, 'use_ep', False):
         return
-    group = group if group is not None else dist.group.WORLD
-    world_size = dist.get_world_size(group)
     for name, param in model.named_parameters():
-        if param.grad is None:
-            continue
         if is_ep_expert_parameter(name):
-            # 每个本地 Expert 已经通过 dispatch 收到了所有 rank 的 Token，
-            # 参数梯度是各 rank loss 梯度之和，只需除以 EP world size。
-            param.grad.div_(world_size)
+            if parallel is not None:
+                dist.broadcast(param.data, src=parallel.ep_rank, group=parallel.dp_group)
         else:
-            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=group)
-            param.grad.div_(world_size)
+            dist.broadcast(param.data, src=0)
 
 
 @torch.no_grad()
-def clip_ep_grad_norm_(model, max_norm, group=None):
-    """计算去重后的全局 EP 梯度范数，并在所有 rank 使用同一缩放系数。"""
-    group = group if group is not None else dist.group.WORLD
-    world_size = dist.get_world_size(group)
+def sync_ep_gradients(model, parallel=None):
+    """共享参数按 WORLD 平均，Expert 按 EP 大小缩放后在 DP 组平均。"""
+    if not getattr(model.config, 'use_ep', False):
+        return
+    ep_size = parallel.ep_size if parallel is not None else dist.get_world_size()
+    expert_has_grad = None
+    if parallel is not None and parallel.dp_size > 1:
+        expert_params = [param for name, param in model.named_parameters()
+                         if is_ep_expert_parameter(name)]
+        expert_has_grad = torch.tensor(
+            [int(param.grad is not None) for param in expert_params],
+            dtype=torch.int32, device=expert_params[0].device,
+        )
+        dist.all_reduce(expert_has_grad, op=dist.ReduceOp.MAX, group=parallel.dp_group)
+        expert_has_grad = iter(expert_has_grad.tolist())
+    for name, param in model.named_parameters():
+        if is_ep_expert_parameter(name):
+            has_grad = next(expert_has_grad) if expert_has_grad is not None else param.grad is not None
+            if not has_grad:
+                continue
+        if param.grad is None:
+            # Keep collective order identical when a replica receives no tokens.
+            param.grad = torch.zeros_like(param)
+        if is_ep_expert_parameter(name):
+            param.grad.div_(ep_size)
+            if parallel is not None and parallel.dp_size > 1:
+                dist.all_reduce(param.grad, group=parallel.dp_group)
+                param.grad.div_(parallel.dp_size)
+        else:
+            dist.all_reduce(param.grad)
+            param.grad.div_(dist.get_world_size())
+
+
+@torch.no_grad()
+def clip_ep_grad_norm_(model, max_norm, parallel=None):
+    """只计算一份共享参数和一份完整 Expert 集合的全局范数。"""
+    world_size = dist.get_world_size()
+    dp_size = parallel.dp_size if parallel is not None else 1
     device = next(model.parameters()).device
     local_squared_norm = torch.zeros((), dtype=torch.float32, device=device)
     for name, param in model.named_parameters():
@@ -110,10 +164,9 @@ def clip_ep_grad_norm_(model, max_norm, group=None):
             continue
         squared_norm = param.grad.detach().float().pow(2).sum()
         # 共享梯度在每个 rank 都相同，求全局范数时只计算一份。
-        if not is_ep_expert_parameter(name):
-            squared_norm.div_(world_size)
+        squared_norm.div_(dp_size if is_ep_expert_parameter(name) else world_size)
         local_squared_norm.add_(squared_norm)
-    dist.all_reduce(local_squared_norm, op=dist.ReduceOp.SUM, group=group)
+    dist.all_reduce(local_squared_norm, op=dist.ReduceOp.SUM)
     total_norm = local_squared_norm.sqrt()
     clip_coef = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
     for param in model.parameters():
@@ -131,7 +184,7 @@ def setup_seed(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
+def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoch=0, step=0, wandb=None, save_dir='../checkpoints', parallel=None, **kwargs):
     os.makedirs(save_dir, exist_ok=True)
     moe_path = '_moe' if lm_config.use_moe else ''
     ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
@@ -146,17 +199,22 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
             if not dist.is_initialized():
                 raise RuntimeError('EP checkpoint requires torch.distributed')
             rank, world_size = dist.get_rank(), dist.get_world_size()
+            ep_size = parallel.ep_size if parallel is not None else world_size
+            dp_size = parallel.dp_size if parallel is not None else 1
+            dp_rank = parallel.dp_rank if parallel is not None else 0
             local_expert_state = {
                 key: value
                 for key, value in state_dict.items()
                 if is_ep_expert_parameter(key)
             }
-            gathered_expert_states = [None] * world_size if rank == 0 else None
-            dist.gather_object(
-                local_expert_state,
-                gathered_expert_states,
-                dst=0,
-            )
+            gathered_expert_states = [None] * ep_size if rank == 0 else None
+            if dp_rank == 0:
+                dist.gather_object(
+                    local_expert_state,
+                    gathered_expert_states,
+                    dst=0,
+                    group=parallel.ep_group if parallel is not None else None,
+                )
 
             export_path = kwargs.pop('export_path', None)
             if rank == 0:
@@ -182,6 +240,9 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
                 'epoch': epoch,
                 'step': step,
                 'world_size': world_size,
+                'ep_size': ep_size,
+                'dp_size': dp_size,
+                'rank': rank,
                 'wandb_id': wandb_id,
             }
             for key, value in kwargs.items():
@@ -246,6 +307,11 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
                 raise RuntimeError(
                     f'EP resume要求相同world_size，checkpoint={saved_ws}, current={current_ws}'
                 )
+            current_ep_size = parallel.ep_size if parallel is not None else current_ws
+            if ckp_data.get('ep_size', saved_ws) != current_ep_size:
+                raise RuntimeError('EP resume要求与保存时相同的ep_size')
+            if ckp_data.get('rank', rank) != rank:
+                raise RuntimeError('EP resume rank与当前rank不一致')
             return ckp_data
         if os.path.exists(resume_path):
             ckp_data = torch.load(resume_path, map_location='cpu')
@@ -258,9 +324,9 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         return None
 
 
-def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
+def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda', parallel=None):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = MiniMindForCausalLM(lm_config)
+    model = MiniMindForCausalLM(lm_config, ep_group=parallel.ep_group if parallel is not None else None)
 
     if from_weight!= 'none':
         moe_suffix = '_moe' if lm_config.use_moe else ''
@@ -286,7 +352,7 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
     Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
     model = model.to(device)
     if lm_config.use_ep:
-        sync_ep_shared_parameters(model)
+        sync_ep_shared_parameters(model, parallel)
     return model, tokenizer
 
 

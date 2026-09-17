@@ -420,7 +420,7 @@ class ExpertParallelMOEFeedForward(nn.Module):
         return y_flat.reshape(batch_size, seq_len, hidden_dim)
 
 class MiniMindBlock(nn.Module):
-    def __init__(self, layer_id: int, config: MiniMindConfig):
+    def __init__(self, layer_id: int, config: MiniMindConfig, ep_group=None):
         super().__init__()
         self.self_attn = Attention(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -428,7 +428,7 @@ class MiniMindBlock(nn.Module):
         if not config.use_moe:
             self.mlp = FeedForward(config)
         elif config.use_ep:
-            self.mlp = ExpertParallelMOEFeedForward(config)
+            self.mlp = ExpertParallelMOEFeedForward(config, process_group=ep_group)
         else:
             self.mlp = MOEFeedForward(config)
 
@@ -443,13 +443,13 @@ class MiniMindBlock(nn.Module):
         return hidden_states, present_key_value
 
 class MiniMindModel(nn.Module):
-    def __init__(self, config: MiniMindConfig):
+    def __init__(self, config: MiniMindConfig, ep_group=None):
         super().__init__()
         self.config = config
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
-        self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+        self.layers = nn.ModuleList([MiniMindBlock(l, config, ep_group=ep_group) for l in range(self.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.head_dim, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
@@ -487,10 +487,10 @@ class MiniMindModel(nn.Module):
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MiniMindConfig
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-    def __init__(self, config: MiniMindConfig = None):
+    def __init__(self, config: MiniMindConfig = None, ep_group=None):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
-        self.model = MiniMindModel(self.config)
+        self.model = MiniMindModel(self.config, ep_group=ep_group)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         if self.config.tie_word_embeddings: self.model.embed_tokens.weight = self.lm_head.weight
         self.post_init()

@@ -19,7 +19,7 @@ from dataset.lm_dataset import PretrainDataset
 from trainer.trainer_utils import (
     get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode,
     setup_seed, init_model, SkipBatchSampler, sync_ep_gradients,
-    clip_ep_grad_norm_
+    clip_ep_grad_norm_, init_ep_dp_groups
 )
 
 warnings.filterwarnings('ignore')
@@ -45,10 +45,10 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         if step % args.accumulation_steps == 0:
             if lm_config.use_ep:
-                sync_ep_gradients(model)
+                sync_ep_gradients(model, parallel)
             scaler.unscale_(optimizer)
             if lm_config.use_ep:
-                clip_ep_grad_norm_(model, args.grad_clip)
+                clip_ep_grad_norm_(model, args.grad_clip, parallel)
             else:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
@@ -86,6 +86,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                     wandb=wandb,
                     save_dir='../checkpoints',
                     export_path=ckp,
+                    parallel=parallel,
                 )
             else:
                 raw_model = model.module if isinstance(model, DistributedDataParallel) else model
@@ -100,10 +101,10 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:
         if lm_config.use_ep:
-            sync_ep_gradients(model)
+            sync_ep_gradients(model, parallel)
         scaler.unscale_(optimizer)
         if lm_config.use_ep:
-            clip_ep_grad_norm_(model, args.grad_clip)
+            clip_ep_grad_norm_(model, args.grad_clip, parallel)
         else:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         scaler.step(optimizer)
@@ -130,6 +131,7 @@ if __name__ == "__main__":
     parser.add_argument('--max_seq_len', default=340, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--use_ep', action='store_true', help="启用可训练Expert Parallel；会自动启用MoE，必须使用torchrun启动")
+    parser.add_argument('--ep_size', type=int, default=None, help="每个EP组的GPU数；默认使用全部GPU")
     parser.add_argument('--num_experts', default=4, type=int, help="全局Expert数量")
     parser.add_argument('--num_experts_per_tok', default=1, type=int, help="每个Token选择的Expert数量（Top-K）")
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_t2t_mini.jsonl", help="预训练数据路径")
@@ -143,11 +145,9 @@ if __name__ == "__main__":
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    parallel = None
     if args.use_ep:
-        if not dist.is_initialized() or dist.get_world_size() < 2:
-            raise RuntimeError('--use_ep训练必须用torchrun启动，并且world_size至少为2')
-        if args.num_experts % dist.get_world_size() != 0:
-            raise ValueError('num_experts必须能被EP world_size整除')
+        parallel = init_ep_dp_groups(args.ep_size, args.num_experts)
         if args.use_compile == 1:
             raise ValueError('当前动态All-to-All EP暂不支持--use_compile 1')
         args.use_moe = 1
@@ -160,11 +160,11 @@ if __name__ == "__main__":
         num_hidden_layers=args.num_hidden_layers,
         use_moe=bool(args.use_moe),
         use_ep=args.use_ep,
-        ep_size=dist.get_world_size() if args.use_ep else None,
+        ep_size=parallel.ep_size if parallel is not None else None,
         num_experts=args.num_experts,
         num_experts_per_tok=args.num_experts_per_tok,
     )
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints', parallel=parallel) if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
@@ -181,7 +181,7 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device, parallel=parallel)
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
