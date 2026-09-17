@@ -45,6 +45,7 @@ class MiniMindConfig(PretrainedConfig):
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
         self.use_ep = kwargs.get("use_ep", False)
         self.ep_size = kwargs.get("ep_size", None)
+        self.ep_comm_dtype = kwargs.get("ep_comm_dtype", "native")
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Model
@@ -221,6 +222,59 @@ def differentiable_all_to_all(x, output_splits, input_splits, group):
     return _AllToAll.apply(x, output_splits, input_splits, group)
 
 
+def _fp8_all_to_all_single(x, output_splits, input_splits, group):
+    """Communicate E4M3 payloads as uint8, with one FP32 scale per peer."""
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8_dtype).max
+    send_chunks = []
+    send_scales = []
+    for chunk in x.split(input_splits, dim=0):
+        if chunk.numel():
+            chunk_fp32 = chunk.float()
+            scale = (chunk_fp32.abs().amax() / fp8_max).clamp_min(
+                torch.finfo(torch.float32).tiny
+            )
+            bits = (chunk_fp32 / scale).clamp(-fp8_max, fp8_max).to(fp8_dtype).view(torch.uint8)
+        else:
+            scale = torch.ones((), dtype=torch.float32, device=x.device)
+            bits = chunk.to(fp8_dtype).view(torch.uint8)
+        send_chunks.append(bits)
+        send_scales.append(scale)
+
+    send_scales = torch.stack(send_scales)
+    recv_scales = torch.empty_like(send_scales)
+    dist.all_to_all_single(recv_scales, send_scales, group=group)
+    recv_bits = _all_to_all_single(
+        torch.cat(send_chunks, dim=0), output_splits, input_splits, group
+    )
+    recv_chunks = recv_bits.view(fp8_dtype).float().split(output_splits, dim=0)
+    return torch.cat(
+        [chunk * scale for chunk, scale in zip(recv_chunks, recv_scales)], dim=0
+    ).to(x.dtype)
+
+
+class _FP8AllToAll(torch.autograd.Function):
+    """FP8 all-to-all with a straight-through backward, also sent as FP8."""
+
+    @staticmethod
+    def forward(ctx, x, output_splits, input_splits, group):
+        ctx.output_splits = tuple(output_splits)
+        ctx.input_splits = tuple(input_splits)
+        ctx.group = group
+        return _fp8_all_to_all_single(x, ctx.output_splits, ctx.input_splits, group)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = _fp8_all_to_all_single(
+            grad_output, ctx.input_splits, ctx.output_splits, ctx.group
+        )
+        return grad_input, None, None, None
+
+
+def differentiable_fp8_all_to_all(x, output_splits, input_splits, group):
+    return _FP8AllToAll.apply(x, output_splits, input_splits, group)
+
+
 class ExpertParallelMOEFeedForward(nn.Module):
     """支持训练与推理的 Top-K Expert Parallel MoE。"""
 
@@ -235,8 +289,14 @@ class ExpertParallelMOEFeedForward(nn.Module):
             raise ValueError(
                 "num_experts_per_tok must be between 1 and num_experts"
             )
+        if config.ep_comm_dtype not in ("native", "fp8"):
+            raise ValueError("ep_comm_dtype must be 'native' or 'fp8'")
 
         self.config = config
+        self.communicate = (
+            differentiable_fp8_all_to_all
+            if config.ep_comm_dtype == "fp8" else differentiable_all_to_all
+        )
         self.process_group = (
             process_group if process_group is not None else dist.group.WORLD
         )
@@ -325,7 +385,7 @@ class ExpertParallelMOEFeedForward(nn.Module):
 
         # dispatch：把 Token 发送到持有目标 Expert 的 rank。该通信参与 autograd，
         # backward 会执行反向 All-to-All，把输入梯度送回 Token 的来源 rank。
-        recv_x = differentiable_all_to_all(
+        recv_x = self.communicate(
             send_x,
             recv_splits,
             send_splits,
@@ -380,7 +440,7 @@ class ExpertParallelMOEFeedForward(nn.Module):
 
         # combine：把 Expert 输出送回 Token 来源 rank。它的 backward 同样是
         # 一次方向相反的 All-to-All，把输出梯度送回 Expert 所在 rank。
-        returned_sorted_output = differentiable_all_to_all(
+        returned_sorted_output = self.communicate(
             recv_order_output,
             send_splits,
             recv_splits,

@@ -615,11 +615,31 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun \
   --use_compile 0
 ```
 
+### 11.5 FP8 通信压缩
+
+预训练、Full SFT 和 `eval_llm.py` 的 EP 模式可加入 `--ep_comm_dtype fp8`。
+默认 `native` 保留原有通信精度。FP8 模式把 dispatch/combine 的隐藏状态按
+目标 Rank 分段，以每段的绝对最大值计算 FP32 缩放系数，再编码为 E4M3。
+E4M3 位模式以 `uint8` 执行 All-to-All，接收后反量化回输入 dtype；反向传播的
+隐藏状态通信也使用相同方式。Token 数量和 Expert ID 等路由元数据不压缩。
+
+```bash
+cd trainer
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  train_pretrain.py --use_ep --ep_comm_dtype fp8 \
+  --num_experts 4 --from_weight pretrain --use_compile 0
+```
+
+FP8 是有损压缩，反向传播对量化采用直通近似；输出和梯度不会与原精度逐位相同。
+每次通信还会交换少量 FP32 缩放系数，因此小 batch 不一定更快。正式训练应先
+比较 loss 与吞吐。模型权重和 checkpoint 格式不变。
+
 ## 12. 验证结果
 
 ### 12.1 普通 MoE 与 EP 输出一致
 
-使用相同权重、相同 Prompt 和相同解码设置对比普通 MoE 与双卡 EP：
+在默认 `native` 通信模式下，使用相同权重、相同 Prompt 和相同解码设置对比普通 MoE 与双卡 EP：
 
 - 多个 Prompt 的输出文本哈希完全一致。
 - 说明 Router、dispatch、本地 Expert、combine、inverse reorder 和权重合并正确。
@@ -690,7 +710,7 @@ Model Params/rank: 108.76M-Global198.42M-Active63.94M
 4. Rank/Expert 分组使用 `argsort`、`bincount` 和逐 Expert Python 循环。
 5. Expert 计算尚未使用 grouped GEMM 或 fused kernel。
 6. 通信和 Expert 计算尚未通过独立 CUDA stream 重叠。
-7. dispatch/combine 没有 FP8 压缩。
+7. FP8 压缩是可选的 E4M3 通信路径；尚无误差反馈或 FP8 fused kernel，默认保持原精度。
 8. 动态 All-to-All 训练当前不支持 `torch.compile`。
 9. 加载时每个 Rank 的 CPU 内存仍会暂时读取完整 checkpoint。
 10. EP resume 暂不支持改变 `WORLD_SIZE` 后自动重分片 optimizer state。

@@ -54,6 +54,7 @@ def init_model(args):
             use_moe=bool(args.use_moe),
             use_ep=bool(args.use_ep),
             ep_size=dist.get_world_size() if args.use_ep else None,
+            ep_comm_dtype=args.ep_comm_dtype,
             num_experts=args.num_experts,
             num_experts_per_tok=args.num_experts_per_tok,
             inference_rope_scaling=args.inference_rope_scaling
@@ -100,6 +101,8 @@ def main():
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--use_ep', action='store_true', help="启用Expert Parallel；会自动启用MoE，必须使用torchrun启动")
+    parser.add_argument('--ep_comm_dtype', choices=['native', 'fp8'], default='native',
+                        help="EP dispatch/combine通信精度；fp8使用E4M3压缩，默认保持原精度")
     parser.add_argument('--num_experts', default=4, type=int, help="全局Expert数量")
     parser.add_argument('--num_experts_per_tok', default=1, type=int, help="每个Token选择的Expert数量（Top-K）")
     parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")

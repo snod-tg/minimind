@@ -785,7 +785,9 @@ Epoch 5: loss 7.4878, aux_loss 0.0010
 4. 使用 Python `argsort`、`bincount`、`.tolist()` 和逐 Expert 循环，存在 GPU/CPU 同步与 kernel launch 开销。
 5. Expert 计算没有 grouped GEMM，也没有把多个 Expert 融合为单个高效 kernel。
 6. 通信与 Expert 计算尚未使用独立 CUDA stream 重叠。
-7. 通信数据未使用 FP8 压缩，dispatch/combine 使用输入 Tensor 的常规精度。
+7. 默认通信仍使用输入 Tensor 的精度；可用 `--ep_comm_dtype fp8` 对 dispatch/combine
+   及其反向的隐藏状态做 E4M3 压缩。该路径按目标 Rank 使用 FP32 缩放系数、通过
+   `uint8` 传输 FP8 位模式，接收后恢复输入 dtype；属于有损压缩，尚无误差反馈。
 8. 当前动态 All-to-All 训练不支持 `torch.compile`。
 9. 完整 checkpoint 会先被每个 Rank 读取到 CPU，再筛选本地参数，CPU 峰值内存尚未优化。
 10. EP resume 暂不支持改变 `WORLD_SIZE` 后自动重分片 optimizer state。

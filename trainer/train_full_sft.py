@@ -129,6 +129,8 @@ if __name__ == "__main__":
     parser.add_argument('--max_seq_len', default=768, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--use_ep', action='store_true', help="启用可训练Expert Parallel；会自动启用MoE，必须使用torchrun启动")
+    parser.add_argument('--ep_comm_dtype', choices=['native', 'fp8'], default='native',
+                        help="EP dispatch/combine通信精度；fp8使用E4M3压缩，默认保持原精度")
     parser.add_argument('--num_experts', default=4, type=int, help="全局Expert数量")
     parser.add_argument('--num_experts_per_tok', default=1, type=int, help="每个Token选择的Expert数量（Top-K）")
     parser.add_argument("--data_path", type=str, default="../dataset/sft_t2t_mini.jsonl", help="训练数据路径")
@@ -160,6 +162,7 @@ if __name__ == "__main__":
         use_moe=bool(args.use_moe),
         use_ep=args.use_ep,
         ep_size=dist.get_world_size() if args.use_ep else None,
+        ep_comm_dtype=args.ep_comm_dtype,
         num_experts=args.num_experts,
         num_experts_per_tok=args.num_experts_per_tok,
     )
