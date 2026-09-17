@@ -46,9 +46,9 @@ global_expert_id = rank * experts_per_rank + local_expert_id
 | `trainer/trainer_utils.py` | EP 参数统计、共享参数初始化、梯度同步、全局梯度裁剪、分片 checkpoint 合并与恢复 |
 | `trainer/train_pretrain.py` | EP 预训练入口、训练参数、手动梯度同步、EP checkpoint 保存 |
 | `trainer/train_full_sft.py` | EP Full SFT 入口、训练参数、手动梯度同步、EP checkpoint 保存 |
-| `.gitignore` | 忽略 `playground/` 学习实验目录 |
+<!-- | `.gitignore` | 忽略 `playground/` 学习实验目录 | -->
 
-`playground/` 中保存了从 Router、Rank、All-to-All、不等长 All-to-All 到完整 EP 的学习代码。该目录用于学习和调试，不属于正式提交内容。
+<!-- `playground/` 中保存了从 Router、Rank、All-to-All、不等长 All-to-All 到完整 EP 的学习代码。该目录用于学习和调试，不属于正式提交内容。 -->
 
 ## 3. 配置项新增
 
