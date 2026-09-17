@@ -443,27 +443,21 @@ Rank 1: experts.2.*, experts.3.*
 
 ### 7.1 共享参数初始化
 
-模型创建后，把 Rank 0 的非 Expert 参数广播到所有 Rank；相同 Expert shard
-则从第一个 EP 副本广播到对应 DP 组，保证各副本初值一致：
+模型创建后，把 Rank 0 的非 Expert 参数广播到所有 Rank，保证 Router、Attention、Embedding 等共享参数初值一致：
 
 ```python
 if not is_ep_expert_parameter(name):
     dist.broadcast(param.data, src=0)
-else:
-    dist.broadcast(param.data, src=ep_rank, group=dp_group)
 ```
 
 ### 7.2 梯度同步
 
-- 共享参数：在 WORLD 上 All-Reduce 并除以 `world_size`。
-- 本地 Expert：梯度已经汇集本 EP 组所有来源 Rank 的贡献，先除以 `ep_size`；
-  然后仅与其他 DP 副本中的**同编号 Expert**同步，并除以 `dp_size`。
+- 共享参数：对梯度执行 All-Reduce 并除以 `world_size`。
+- 本地 Expert：不能与其他 Rank 的不同 Expert 做 All-Reduce；其梯度只除以 `world_size`，保持与全局平均 loss 相同的尺度。
 
 ```python
 if is_ep_expert_parameter(name):
-    param.grad.div_(ep_size)
-    dist.all_reduce(param.grad, group=dp_group)
-    param.grad.div_(dp_size)
+    param.grad.div_(world_size)
 else:
     dist.all_reduce(param.grad)
     param.grad.div_(world_size)
@@ -473,14 +467,13 @@ else:
 
 `clip_ep_grad_norm_()` 会计算去重后的全局范数：
 
-- Expert 梯度跨 DP 副本重复，计算时只计一份。
+- 本地 Expert 梯度在各 Rank 求和。
 - 共享参数在所有 Rank 都有副本，计算全局范数时只计一次。
 - 所有 Rank 使用相同的裁剪系数。
 
 ## 8. Router 负载均衡损失
 
-EP 保留了原 MoE 的 Router auxiliary loss。先统计各 Expert 的 Top-K 路由比例，
-再在当前 EP 组内做 All-Reduce，得到该副本的负载分布：
+EP 保留了原 MoE 的 Router auxiliary loss。先统计各 Expert 的 Top-K 路由比例，再跨 Rank 做 All-Reduce，得到全局负载分布：
 
 ```python
 load = F.one_hot(
@@ -488,7 +481,7 @@ load = F.one_hot(
     num_experts,
 ).float().mean(dim=(0, 1))
 
-dist.all_reduce(load, group=ep_group)
+dist.all_reduce(load)
 load /= ep_size
 
 aux_loss = (
@@ -505,7 +498,7 @@ Top-K 的离散 Expert ID 不参与梯度，梯度通过连续的 `scores` 返�
 每个 Rank 的 `state_dict` 只包含共享参数和本地 Expert shard。保存时：
 
 1. 每个 Rank 提取自己的 Expert 参数。
-2. 第一个 EP 副本使用 `dist.gather_object` 把 Expert shard 发给 Rank 0。
+2. 使用 `dist.gather_object` 把 Expert shard 发给 Rank 0。
 3. Rank 0 合并全部全局 Expert。
 4. 写出普通 MoE 也可以加载的完整权重：`{weight}_{hidden_size}_moe.pth`。
 
@@ -525,8 +518,7 @@ Optimizer state 与参数 shard 绑定，所以每个 Rank 分别保存：
 ...
 ```
 
-逐 Rank resume 包含模型 shard、optimizer、scaler、epoch、step、`world_size`、
-`ep_size` 和 `dp_size`。当前恢复训练要求 `world_size` 和 `ep_size` 与保存时一致。
+逐 Rank resume 包含模型 shard、optimizer、scaler、epoch、step 和保存时的 `world_size`。当前恢复训练要求 `world_size` 与保存时一致。
 
 ## 10. 推理如何实现
 
@@ -623,33 +615,6 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun \
   --use_compile 0
 ```
 
-### 11.5 四卡 DP × EP 预训练
-
-`WORLD_SIZE=4`、`ep_size=2` 时，Rank 0–1 和 2–3 分别组成一个 EP 副本；
-Rank 0/2、1/3 分别同步相同的 Expert shard。每张卡仍由全局
-`DistributedSampler` 读取不同样本。省略 `--ep_size` 时保持原有纯 EP 行为。
-
-```bash
-cd trainer
-
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
-  --standalone \
-  --nproc_per_node=4 \
-  train_pretrain.py \
-  --use_ep \
-  --ep_size 2 \
-  --num_experts 4 \
-  --num_experts_per_tok 1 \
-  --from_weight pretrain \
-  --from_resume 0 \
-  --save_weight pretrain_dp_ep \
-  --use_compile 0
-```
-
-`train_full_sft.py` 使用相同的 `--use_ep --ep_size 2` 配置。续训时必须保持
-`WORLD_SIZE`、`ep_size`、专家数及模型结构一致。完整推理权重由第一个 EP 副本
-合并导出，续训文件仍按全局 Rank 分别保存。
-
 ## 12. 验证结果
 
 ### 12.1 普通 MoE 与 EP 输出一致
@@ -719,8 +684,8 @@ Model Params/rank: 108.76M-Global198.42M-Active63.94M
 
 ## 13. 当前限制
 
-1. 训练可使用独立的 EP group 和 DP group；推理入口仍只支持纯 EP。
-2. Expert 必须平均分配，`num_experts` 必须能被 `ep_size` 整除。
+1. 当前直接使用 `dist.group.WORLD`，还没有拆分独立的 EP group 与 DP group。
+2. Expert 必须平均分配，`num_experts` 必须能被 `WORLD_SIZE` 整除。
 3. 没有实现 Expert capacity、Token dropping 或溢出策略。
 4. Rank/Expert 分组使用 `argsort`、`bincount` 和逐 Expert Python 循环。
 5. Expert 计算尚未使用 grouped GEMM 或 fused kernel。
@@ -728,7 +693,7 @@ Model Params/rank: 108.76M-Global198.42M-Active63.94M
 7. dispatch/combine 没有 FP8 压缩。
 8. 动态 All-to-All 训练当前不支持 `torch.compile`。
 9. 加载时每个 Rank 的 CPU 内存仍会暂时读取完整 checkpoint。
-10. EP resume 暂不支持改变 `WORLD_SIZE` 或 `ep_size` 后自动重分片 optimizer state。
+10. EP resume 暂不支持改变 `WORLD_SIZE` 后自动重分片 optimizer state。
 11. 当前只接入预训练和 Full SFT，DPO、PPO、GRPO 等训练器尚未接入。
 12. EP 只切分 Expert；Attention、Embedding、LM Head 等共享参数仍完整复制。
 
@@ -742,9 +707,9 @@ Model Params/rank: 108.76M-Global198.42M-Active63.94M
 
 EP 的每个 Rank 都需要加入同一个 distributed process group，并在相同位置执行 All-to-All collective。直接运行普通 `python` 没有这些 Rank 信息。
 
-### 为什么 `num_experts` 必须整除 `ep_size`？
+### 为什么 `num_experts` 必须整除 GPU 数？
 
-当前实现采用静态平均分片，每个 EP 组内的 Rank 保存相同数量的 Expert。未来可以扩展非均匀 Expert placement，但当前版本没有实现。
+当前实现采用静态平均分片，每个 Rank 保存相同数量的 Expert。未来可以扩展非均匀 Expert placement，但当前版本没有实现。
 
 ### 为什么不能直接使用 DDP？
 
@@ -760,7 +725,8 @@ All-to-All 是 collective。只让 Rank 0 进入模型、其他 Rank 不进入�
 
 ## 15. 后续优化方向
 
-1. 把路由元数据封装为可复用 handle，减少重复排序和分配。
+1. 拆分 DP group 与 EP group，支持 DP × EP 的二维并行。
+2. 把路由元数据封装为可复用 handle，减少重复排序和分配。
 3. 移除 `.tolist()` 带来的 CPU/GPU 同步。
 4. 使用 grouped GEMM 合并多个本地 Expert 的计算。
 5. 用独立 CUDA stream 重叠 dispatch/combine 与 Expert 计算。
