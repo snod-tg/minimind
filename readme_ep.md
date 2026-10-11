@@ -4,6 +4,8 @@
 > 项目：在 MiniMind 原生 PyTorch MoE 上实现可训练、可推理的 Expert Parallel  
 > 当前状态：已完成 Top-K 路由、动态不等长 All-to-All、反向传播、训练同步、Checkpoint 和多卡推理闭环
 
+[DeepEP机制迁移与验收](doc/ep/design/14_DeepEP优化闭环.md) · [当前开发与训练入口](#本地开发入口) · [项目组织](doc/ep/design/project_structure.md)
+
 ## 1. 项目概述
 
 MiniMind 原有的 `MOEFeedForward` 会在每个进程中创建全部 Expert。即使一个 Token 只激活少量 Expert，每张 GPU 仍然保存所有 Expert 参数。Expert 数量继续增加时，单卡显存会成为主要限制。
@@ -748,7 +750,7 @@ All-to-All 是 collective。只让 Rank 0 进入模型、其他 Rank 不进入�
 1. 拆分 DP group 与 EP group，支持 DP × EP 的二维并行。
 2. 把路由元数据封装为可复用 handle，减少重复排序和分配。
 3. 移除 `.tolist()` 带来的 CPU/GPU 同步。
-4. 使用 grouped GEMM 合并多个本地 Expert 的计算。
+4. 扩展可选 grouped GEMM 推理路径的全层数值兼容性和整体性能；训练仍用原专家前向。
 5. 用独立 CUDA stream 重叠 dispatch/combine 与 Expert 计算。
 6. 增加 capacity、Token dropping 和负载不均衡保护。
 7. 将完整 checkpoint 改为真正的分片读写。
@@ -772,3 +774,65 @@ All-to-All 是 collective。只让 Rank 0 进入模型、其他 Rank 不进入�
 ```
 
 当前实现已经可以完成 EP 推理、预训练和 Full SFT，并通过普通 MoE 输出一致性、Top-1/Top-2 backward、BF16 多 epoch 训练、真实模型 smoke test 和 checkpoint resume 验证。
+
+
+## 本地开发入口
+
+模型相关修改统一在本项目，CUDA 张量操作通过独立 my_cuda_kernels 包调用。
+
+| 内容 | 入口 |
+| --- | --- |
+| 项目职责和目录 | [组织说明](doc/ep/design/project_structure.md) |
+| 安装、验证、训练与 tmux | [具体指令](doc/ep/commands/local_workflow.md) |
+| 本轮整理验收 | [结果](doc/ep/results/organization_20261009.md) |
+| 测试环境 | [环境记录](doc/ep/environment.md) |
+| 路由实现 | model/ep/routing.py |
+| 训练配置 / 启动 | configs/ep/pretrain_6_top2.json / scripts/ep/train.py |
+| 模型测试 | tests/ep |
+| EP 数值和性能 | [EP 优化](analysis/ep_routing_optimization.md) · [API](analysis/ep_routing_api.md) |
+| Grouped GEMM 模型接入 | [接入分析](analysis/grouped_gemm_split_integration.md) |
+| 权重布局 | [KN 分析](analysis/minimind_kn_checkpoint.md) |
+
+```bash
+python -m pip install --no-deps --no-build-isolation -e ../my_cuda_kernels
+python ../my_cuda_kernels/script/build.py ep
+python -m unittest tests.ep.test_local_contracts -v
+python -m scripts.ep.train --run-id ep6_top2_new --gpus 2,3 --tmux --dry-run
+```
+
+默认训练：6 专家 Top-2、hidden768、8层、batch32/Rank、seq340、BF16、LR5e-4、累积8、裁剪1、2epochs，原数据从头预训练。使用原 PyTorch 专家与 compact EP，没有训练失败后的自动回退。专家数和 Top-K 可在配置文件调整；缺库或非法配置直接报错。
+
+专家及模型张量计算可 compile；动态 counts、NCCL splits 与专家选择保留明确边界。每轮使用独立 runs/<run_id>，保存配置、日志、完整模型、两 Rank 恢复状态和退出码。
+
+## 可选 Grouped GEMM 推理
+
+model/backends 提供完整专家 MLP 与 CUDA Prefill/Decode 适配，model/checkpoint_kn.py 提供转换/加载。默认 expert_backend=original；native_bf16 保持原专家结果，cuda_split_last_layer 是受限推理路径，cuda_split 全层仍是实验选项。FP32 累加并输出 BF16 与原 BF16 中间归约存在差异，完整模型数值准入未通过。
+
+```bash
+python ../my_cuda_kernels/script/build.py grouped_gemm
+CUDA_VISIBLE_DEVICES=4,5 python -m torch.distributed.run --standalone --nproc_per_node=2 eval_llm.py   --use_ep --weight pretrain_ep --hidden_size 768 --num_hidden_layers 8   --num_experts 4 --num_experts_per_tok 1 --model_dtype bf16 --expert_backend cuda_split_last_layer
+```
+
+库默认由已安装的算子包解析；可传 grouped_gemm_library 覆盖。普通 NK 权重会在推理缓存阶段打包；显式 kn_checkpoint 加载转换后权重。专家 GEMM 只有前向，当前正式训练仍用原 PyTorch 专家。
+
+## 2026-10-11：6选2模型验收与EP复测
+
+最终模型与两Rank恢复状态通过加载、有限性和输出验收；服务器正式包切换后，original/compact的隐藏状态、logits和生成Token一致。GPU5/7、31轮配对测量，compact整模型耗时下降8.65%～20.88%；M10880峰值allocated显存约1.51→2.96GiB。推理两路径均为eager、原PyTorch专家、BF16 autocast。BOS补齐后可连续续写，常识准确性仍需单独评估。
+
+[分析与图表](analysis/ep6_top2_validation_and_baseline.md) · [验收](doc/ep/design/10_新模型验收.md) · [迁移](doc/ep/design/11_服务器迁移.md) · [性能指令](doc/ep/commands/12_6选2EP基线.md)
+
+## 2026-10-11：无EP与EP公平训练基线
+
+RTX4090D物理GPU5/7，2 Rank；hidden768、8层、专家中间维度2432、6专家Top-2。每Rank batch32、seq340、梯度累积8、LR5e-4、裁剪1、AdamW；FP32参数与优化器状态、BF16 autocast、原PyTorch专家。三组统一eager，不启用compile。全局每次更新512条序列，最多174080个padding内Token；吞吐主指标只计移位后labels非-100的有效Token。
+
+| 模式 | 有效 Token/s | 每次更新 s | 8次更新窗口 s | 峰值 allocated GiB | 峰值 reserved GiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 无 EP（DDP） | 71,620 | 1.4798 | 11.839 | 13.305 | 14.561 |
+| 基础 EP | 68,670 | 1.5482 | 12.385 | 10.717 | 13.459 |
+| 优化 compact EP | 71,685 | 1.4899 | 11.920 | 10.302 | 13.594 |
+
+三组统一原无EP辅助损失及每次累积更新的同步频率，参数化选项不改变legacy默认。三轮短训练仅支持稳态吞吐与显存比较，完整两轮时间和模型质量另行验收。
+
+[完整分析](analysis/ep6_top2_fair_training_baseline.md) · [复现指令](doc/ep/commands/13_公平训练基线.md)
+
+本轮compact与无EP的训练吞吐基本持平，allocated峰值下降22.57%；显卡进程采样峰值15.104→14.172GiB。两轮总时间仍需完整对照，不据短测宣称完整训练提速。

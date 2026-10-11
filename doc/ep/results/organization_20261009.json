@@ -1,0 +1,21 @@
+{
+  "unchanged_math_definitions": [
+    "grouped_gemm_split.py:family_for",
+    "grouped_gemm_split.py:validate_counts",
+    "grouped_gemm_split.py:grouped_gemm",
+    "grouped_gemm_split.py:GemmWorkspace",
+    "grouped_gemm_api.py:check_counts",
+    "grouped_gemm_api.py:grouped_gemm",
+    "grouped_gemm_api.py:GemmWorkspace",
+    "grouped_expert_mlp_split.py:GroupedExpertMLP",
+    "minimind_ep_split_backend.py:MiniMindEPSplitBackend",
+    "ep:Workspace",
+    "ep:combine_inference",
+    "native_bf16:exact_source"
+  ],
+  "cuda_files_unchanged": 17,
+  "cpu_tests_passed": 8,
+  "markdown_links_checked": 283,
+  "broken_links": 0,
+  "active_python_files_parsed": 49
+}

@@ -1,5 +1,6 @@
 import math, torch, torch.distributed as dist, torch.nn.functional as F
 from torch import nn
+from model.moe_aux_loss import moe_aux_loss
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
@@ -43,6 +44,9 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+        self.router_aux_loss_mode = kwargs.get("router_aux_loss_mode", "legacy")
+        if self.router_aux_loss_mode not in ("legacy", "local_topk_sum"):
+            raise ValueError("router_aux_loss_mode must be legacy or local_topk_sum")
         self.use_ep = kwargs.get("use_ep", False)
         self.ep_size = kwargs.get("ep_size", None)
         self.ep_comm_dtype = kwargs.get("ep_comm_dtype", "native")
@@ -172,8 +176,7 @@ class MOEFeedForward(nn.Module):
             elif self.training:
                 y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
         if self.training and self.config.router_aux_loss_coef > 0:
-            load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
-            self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
+            self.aux_loss = moe_aux_loss(scores, topk_idx, self.config)
         else:
             self.aux_loss = scores.new_zeros(1).squeeze()
         return y.view(batch_size, seq_len, hidden_dim)
@@ -351,6 +354,12 @@ class ExpertParallelMOEFeedForward(nn.Module):
                 topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             )
 
+        routing_backend = getattr(self, "_ep_routing_backend", None)
+        if routing_backend is not None and routing_backend.can_use(self, x_flat):
+            return routing_backend(self, x_flat, topk_expert_id, topk_weight, scores).reshape(
+                batch_size, seq_len, hidden_dim
+            )
+
         # Top-K turns every Token into K independent routing assignments.
         # assignment_token_indices remembers which original Token each returned
         # Expert output must be accumulated into.
@@ -412,24 +421,28 @@ class ExpertParallelMOEFeedForward(nn.Module):
         local_expert_counts = torch.bincount(
             recv_local_expert_id,
             minlength=self.experts_per_rank,
-        ).tolist()
+        )
 
-        expert_outputs = []
-        offset = 0
-        for local_id, count in enumerate(local_expert_counts):
-            end = offset + count
-            if count > 0:
-                global_id = self.first_expert_id + local_id
-                expert_outputs.append(
-                    self.experts[str(global_id)](expert_sorted_x[offset:end])
-                )
-            offset = end
-
-        if expert_outputs:
-            expert_sorted_output = torch.cat(expert_outputs, dim=0)
+        backend = getattr(self, "_grouped_expert_backend", None)
+        if backend is not None and backend.can_use(self, expert_sorted_x):
+            expert_sorted_output = backend(self, expert_sorted_x, local_expert_counts)
         else:
-            # Keep a correctly shaped empty output when this rank receives no Token.
-            expert_sorted_output = expert_sorted_x.clone()
+            expert_outputs = []
+            offset = 0
+            for local_id, count in enumerate(local_expert_counts.tolist()):
+                end = offset + count
+                if count > 0:
+                    global_id = self.first_expert_id + local_id
+                    expert_outputs.append(
+                        self.experts[str(global_id)](expert_sorted_x[offset:end])
+                    )
+                offset = end
+
+            if expert_outputs:
+                expert_sorted_output = torch.cat(expert_outputs, dim=0)
+            else:
+                # Keep a correctly shaped empty output when this rank receives no Token.
+                expert_sorted_output = expert_sorted_x.clone()
 
         inverse_expert_indices = torch.empty_like(expert_sort_indices)
         inverse_expert_indices[expert_sort_indices] = torch.arange(
@@ -463,17 +476,9 @@ class ExpertParallelMOEFeedForward(nn.Module):
         )
 
         if self.training and self.config.router_aux_loss_coef > 0:
-            # top-k 选择本身不可导；负载统计只作为 gate 概率的平衡目标。
-            load = F.one_hot(
-                topk_expert_id,
-                self.config.num_experts,
-            ).float().mean(dim=(0, 1))
-            if self.ep_size > 1:
-                dist.all_reduce(load, op=dist.ReduceOp.SUM, group=self.process_group)
-                load.div_(self.ep_size)
-            self.aux_loss = (
-                load * scores.mean(dim=0)
-            ).sum() * self.config.num_experts * self.config.router_aux_loss_coef
+            self.aux_loss = moe_aux_loss(
+                scores, topk_expert_id, self.config, self.process_group
+            )
         else:
             self.aux_loss = scores.new_zeros(())
 
@@ -564,7 +569,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
-    
+
     # https://github.com/jingyaogong/minimind/discussions/611
     @torch.inference_mode()
     def generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs):
@@ -581,7 +586,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             if repetition_penalty != 1.0:
                 for i in range(input_ids.shape[0]):
                     seen = torch.unique(input_ids[i]); score = logits[i, seen]; logits[i, seen] = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
-            if top_k > 0: 
+            if top_k > 0:
                 logits[logits < torch.topk(logits, top_k)[0][..., -1, None]] = -float('inf')
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)

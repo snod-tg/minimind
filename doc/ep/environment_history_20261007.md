@@ -1,0 +1,191 @@
+> 历史实验记录：保留该轮配置和结果；当前执行入口见项目 README。
+
+# 测试环境记录
+
+## 用途
+记录实际硬件、软件、模型、输入和计时约定。结果引用轮次；环境变化追加记录，不将不同条件的耗时当成优化收益。
+
+## 阶段 01 正式环境：R04 与 R06，2026年10月7日
+
+| 项目 | 实际值 |
+| --- | --- |
+| 主机 | Server-Internet，Linux 5.15.0-139-generic，glibc 2.31 |
+| GPU | 物理 GPU 1、2，RTX 4090D，各 24564 MiB，114 SM |
+| GPU UUID | 1：GPU-bd37dfef-cd01-6b76-43c4-0691676650fc；2：GPU-03484124-0093-1b45-56d5-ee261c13adef |
+| 双卡拓扑 | NODE，同 NUMA 0，未使用 NVLink |
+| 驱动 | 570.133.20 |
+| 可见设备 | CUDA_VISIBLE_DEVICES=1,2；进程 local_rank 0/1 对应物理 1/2 |
+| GPU 频率/功耗 | 未锁频、未修改功耗限制；查询功耗上限 425 W |
+| Python 环境 | `/data/user4/tongleiwen/tilelang-3032/.venv` |
+| 激活 | `source /data/user4/tongleiwen/tilelang-3032/.venv/bin/activate` |
+| Python | 3.13.5 |
+| PyTorch / Transformers / NumPy | 2.9.0+cu128 / 5.2.0 / 2.5.3 |
+| CUDA 运行时 / cuDNN / NCCL | 12.8 / 91002 / 2.27.5 |
+| 系统 nvcc | CUDA Toolkit 12.4.99，本阶段未编译新 CUDA 算子 |
+| 当前 PATH 的 g++ | Ubuntu GCC 9.4.0，本阶段没有使用它编译算子 |
+| 可用 Conda 编译器 | SCVideo 下 x86_64-conda-linux-gnu-c++，GCC 12.4.0，后续编译可显式选用 |
+| CPU 线程 | torch.set_num_threads(1)，OMP_NUM_THREADS=1，未固定 CPU affinity |
+| 其他任务 | GPU 1、2 启动前无计算进程；服务器其他 GPU 有任务，因此不宣称整机独占 |
+
+## 模型与版本
+- 模型目录：`/data/user4/tongleiwen/minimind`；Git `9511eab6d116d30cfc34a234d527f7e1b810be97`。
+- 测量源码：服务器 model_minimind.py 原样快照，SHA256 `415010017217ba57d52d2ac5f82cda030b83dbc43ddb3b1af06846225bcdf9be`。
+- 本地 Code/minimind Git `7c9a03b9be61f33184130775be75773bf229aa08`，与服务器版本不同；本轮固定使用服务器快照。
+- checkpoint：`/data/user4/tongleiwen/minimind/out/pretrain_ep_768_moe.pth`，SHA256 `37f42844c386e8aca7191c8fbcc6f39427da8f45bfb2a016cbf0ca3cbc913d0c`。
+- checkpoint 存储类型 FP16，加载为 FP32 参数；BF16 autocast。实际专家输入/输出 BF16。
+- hidden=768、intermediate=2432、8 层、4 专家、2 Rank、每 Rank 2 专家；native 通信。
+- dropout=0，eval + inference_mode，无训练反向、无 CUDA Graph。
+- Top-1 为原 checkpoint 路由配置；Top-2 是同权重下的路由实验，不代表训练好的 Top-2 模型。
+
+## 输入
+数据来自既有 pretrain_t2t_mini.jsonl 前 512 条文本，使用现有 tokenizer 编码，加 BOS/EOS 后拼接为无 padding 输入。Token pool、起始位置、每 Rank 输入哈希与对应负载记录在结果中。
+
+每 Rank Prefill：B=1/S=128、B=8/S=340、B=32/S=340；Decode：B=1/16、S=1、KV context=128。每个组合使用固定输入快照重复测量，counts 范围来自跨层/Rank 的记录，并非生产请求分布。
+
+Top-1 与 Top-2 使用不同文本快照，Decode 输入还来自相应模型的 argmax；两者差异不作为只改变 Top-K 的受控结论。新旧算子比较必须在同一组合内复用同输入。R04 与 R06 的每 Rank 输入哈希已核对相同。
+
+## 计时与诊断
+- R04：模型预热 5 次、计时 30 次；单独抓取 3 次 profiler；选第 0/3/7 层回放 MLP/EP，预热 3 次、计时 30 次。
+- R06：独立进程，模型预热 20 次、计时 60 次，不做 profiler 和数据抓取。正式模型延迟表采用此轮。
+- 原始 forward 计时，barrier 在计时外，结束同步；每次取较慢 Rank 的 wall time，再统计中位数/P95。CUDA event 区间也保存，它可能包含 CPU 提交空隙。
+- Prefill 包含全部位置 logits 与 KV cache；Decode 是固定 KV 快照单步前向，包含新 cache 构建，不含采样、tokenizer、持续生成或调度系统。
+- Profiler 的 CPU 区间含其开销与等待；GPU kernel 可能重叠；NCCL kernel 含等待，不能看作链路纯传输时间。分段数据不相加推算正式模型时间。
+- R05 由原始 Chrome trace 校正同名 CPU/GPU 注释重复统计；诊断使用校正数据。
+
+## 环境调整历史
+| 轮次 | 情况 | 处理 |
+| --- | --- | --- |
+| R00 | 已验证 TileLang venv 可导入 torch 与 transformers | 记录发现环境 |
+| R01 | 用户先指定 SCVideo：Python 3.13.13、torch 2.9.1+cu128、Transformers 5.4.0、NumPy 2.4.4、GCC 12.4.0；激活脚本受 nounset 影响 | 未进入 GPU 测量 |
+| R02 起 | 用户允许可用时优先用 venv | 全部实际 GPU 测量使用 venv |
+
+Venv 导入 Transformers 有 SciPy/NumPy 范围警告，本阶段没有调用 SciPy 数值接口；冒烟和 20 个输出一致性验证均通过。本轮未安装或替换依赖。
+
+## 阶段 02 环境与验证口径
+2026年10月7日，R01 为 CPU 输入审核，R02/R03 使用物理 GPU 1；仍使用相同 TileLang venv、PyTorch/CUDA 与 RTX 4090D，没有安装依赖或编译 CUDA 扩展。源码与 checkpoint SHA256 再次核对相同，生产仓库 tracked 文件无修改。GPU 1 的验证进程退出后显存恢复 24 MiB。
+
+原 FeedForward 参考沿用 FP32 参数、BF16 autocast；转换布局参考使用预先转换的 BF16 权重、显式 BF16 输入，在 autocast 外执行。合成参考另覆盖 FP16，FP32 matmul 参考关闭 TF32。随机种子 20261007，三组 N/K、E=1/2/16。验证同步用于数值与元数据检查，不是待实现 API 的性能路径；权重准备时间仅为初始化成本记录。
+
+[阶段 02 契约](../../../my_cuda_kernels/doc/design/02_输入约定.md) · [阶段 02 结果](../../../my_cuda_kernels/doc/results/02_输入约定.md)。
+
+[阶段说明](design/01_基线测量.md) · [精确指令](commands/01_基线测量.md) · [实测结果](results/01_基线测量.md)。
+
+## 阶段 03：kernel9，2026年10月7日
+
+| 项目 | 实际值 |
+| --- | --- |
+| GPU | 单 Rank、物理 GPU 1，RTX 4090D，114 SM，24564 MiB；UUID 沿用前述 GPU 1 |
+| Python | TileLang venv，Python 3.13.5、PyTorch 2.9.0+cu128；未切换到 SCVideo Python |
+| 编译器 | `/data/share/home/user4/.conda/envs/SCVideo/bin/x86_64-conda-linux-gnu-c++`，GCC 12.4.0 |
+| CUDA 编译 | `/usr/local/cuda/bin/nvcc`，12.4.99，`-O3 -std=c++17 -arch=sm_89`；未使用 fast-math |
+| 运行时 | native CUDA runtime 12.4；Python PyTorch CUDA 12.8；驱动 570.133.20 |
+| Compute Sanitizer | `/usr/local/cuda/bin/compute-sanitizer`，2024.1 |
+| Nsight Compute | `/usr/local/cuda/nsight-compute-2024.1.0/ncu`；R18 返回 ERR_NVGPUCTRPERM，计数器未采集 |
+| 精度 | BF16 模型维度及 FP16 回归；FP32 累加；参考关闭 TF32 |
+| shape | E=1～16，三组 (K,N)：(768,2432)/(2432,768)/(1024,1024) |
+| 实测边界 | 总 M=0～65536，单专家 M 至 32769；不将 int32 索引上限当作全范围安全实测 |
+| stream | Python 验证/计时用显式非默认 CUDA stream；native sanitizer/CLI 用默认 stream |
+| 测量 | 预分配张量/工作区、热缓存、不锁频；每图 64 次调用、7 轮轮换、每轮 10 次 replay，中位数 |
+| 计时范围 | kernel9 纯计算已准备元数据；完整路径含 GPU 元数据；CUTLASS 描述符预建，百分比只比较纯计算 |
+| 绘图 | 服务器 venv 的 Matplotlib 3.10.0 |
+
+性能负载使用固定种子 20261007 的随机矩阵，counts 包含真实采集分配与人工分配；不把随机矩阵的算子计时表述为真实完整 MLP 的耗时。数值验证另回放 36 个真实 MLP 的 108 次 gate/up/down 分组投影。checkpoint 的 SHA256 与阶段 01 相同。
+
+CUTLASS 比较使用既有 SM80 TensorOp grouped adapter；device/host/extra 的 SHA256 分别为：
+
+- `8141fa729cd029d64f823345ea44e9844fcdf3ab6f11a19b550a422a347deb58`
+- `be3f696c30cb92902af56eabd9e0a7a8ae3137ed8d31299bccc9c01de6053960`
+- `132049d8afbe8b3494928205549879b76ab746100957764d133a6206df4665dd`
+
+当前 CUTLASS 头文件仓库检出 `b2dd65dc864e09688245b316ac46c4a6cd07e15c`（v4.1.0-31-gb2dd65dc）；既有二进制的原编译提交未单独记录，故用二进制 SHA 固定此次参考，不把当前检出当成原构建提交。最终 kernel9 bridge SHA256 为 `991cfb133ff96e7b2a5c030be5cb6ac6c6966910f75ae77f69565bb1a899e484`，计时脚本 SHA256 为 `0bdd69601af82551bdb911e79a50de021c79447c5ed1602453e225661921985e`。
+
+GPU 1 测量期间没有其他计算进程与本任务共用该卡；其他 GPU 上的既有任务未处理。未安装依赖、未修改驱动或锁频。阶段 03 没有替换 MiniMind 生产模型或注册正式 PyTorch API。
+
+[阶段 03 说明](../../../my_cuda_kernels/doc/design/03_kernel9.md) · [阶段 03 指令](../../../my_cuda_kernels/doc/commands/03_kernel9.md) · [阶段 03 结果](../../../my_cuda_kernels/doc/results/03_kernel9.md)。
+
+## 阶段 04：PyTorch 接口，2026年10月7日
+
+沿用 TileLang venv 的 Python 3.13.5、torch 2.9.0+cu128、系统 nvcc 12.4.99、SCVideo GCC12.4 和 sm_89。torch 实际 include/lib 根目录为 `/opt/anaconda3/lib/python3.13/site-packages/torch`，C++11 ABI=true；原 venv 使用该安装。R01 发现没有 Ninja，R02 起直接编译并链接 torch/c10、CUDA runtime 和 cuBLAS，没有安装 Ninja 或其他依赖。
+
+R06 数值/设备检查用物理 GPU 1、2（CUDA_VISIBLE_DEVICES=1,2），验证输入在逻辑 0 而当前设备为逻辑 1 时设备恢复。其余主要数值/stream 测试在逻辑 0 的显式非默认 stream 上执行。R07 性能、R08 memcheck 仅用物理 GPU 1。
+
+接口 CUDA 计算源码与阶段 03 相同；R05 最终 PyTorch 扩展 SHA256 为 `4154552b563c947f708254d30da9284a9a6b18b230affcca07746e91b31ac6b3`。输入/权重需无梯度，精度 BF16/FP16、FP32 累加。数值测试使用同种子随机矩阵和 FP32/CPU double 参考；cache 测试使用同维度模拟 FP32 专家模块。阶段 04 尚未回放完整真实专家 MLP。
+
+Graph 与 eager 分开测量：Graph 每图 64 次调用、7 轮交替、每轮 10 次 replay；eager 每批 64 次调用、末尾同步，7 轮交替。前者排除捕获/主机准备；后者包含 CPU 提交与自动路径的分配成本，Event 也含提交空隙。三个入口使用同一完整 kernel9，不把 C ABI 与 dispatcher 的差值当成单独 C++ dispatcher 成本。不锁频、热缓存，不将本轮与阶段 03 的 CUTLASS 时间拼接比较。
+
+R08 用 Compute Sanitizer memcheck 验证 5 案例的两种 API 与非默认 stream，零错误；未重新执行计算核心全部 race/sync 组合。服务器其他 GPU 的既有任务未处理。
+
+[阶段 04 说明](../../../my_cuda_kernels/doc/design/04_PyTorch接口.md) · [阶段 04 指令](../../../my_cuda_kernels/doc/commands/04_PyTorch接口.md) · [阶段 04 结果](../../../my_cuda_kernels/doc/results/04_PyTorch接口.md)。
+
+## 阶段 05：真实完整 MLP，2026年10月7日
+
+补采使用物理 GPU1/2、EP=2；全部单 Rank 回放、正式性能和 memcheck 使用物理 GPU1 的 RTX 4090D。仍用 TileLang venv 的 Python 3.13.5、torch 2.9.0+cu128、CUDA runtime 12.8，未安装依赖。模型和 checkpoint SHA 与阶段 01 相同。
+
+复用阶段 04 R05 dispatcher 扩展（SHA256 `4154552b563c947f708254d30da9284a9a6b18b230affcca07746e91b31ac6b3`），本轮未重编计算核心。真实输入为 36 原回放加 64 补采，合计 100 个，M=0～22463，8 层、两 Rank、top1/top2；真实模型参数 FP32，autocast BF16，packed 权重与激活 BF16、GEMM 累加 FP32。top2 为路由压力实验。
+
+独立 MLP 使用显式非默认 CUDA stream。Graph 每图 16 次完整 MLP、7 轮轮换、每轮 5 次 replay；eager 每批 32 次调用、末尾同步、7 轮轮换。原热态参考使用普通 Parameter，在单个 autocast 上下文中测量；未把每步 BF16 权重转换当作已证实瓶颈。计时包含三投影、两激活操作、kernel9 GPU 元数据；counts/H2D、权重缓存与工作区准备、路由、通信在区间外。工作区变形成本留到模型接入测量。
+
+CUTLASS 仍使用阶段 03 记录的三个固定 SHA 二进制，预建静态 counts 描述符；每个 gate/up 或 down 形状扫描 56 配置×3 CTA 数，162 有效 / 6 不支持，合计 18 次选择。9 个场景、5 条控制路径同轮正式计时。其 C ABI 与 PyTorch dispatcher 的主机成本不同，不把 eager 差值视为纯 kernel 效率。
+
+Compute Sanitizer memcheck R07 / R09 完整链均零错误；最终类另覆盖 Graph 更新 counts、空 M、形状不匹配、cache 失效、训练模式、错配源与 requires_grad 空输入拒绝。没有在本阶段重复全部计算核心 racecheck/synccheck，也没有获得 ncu 计数器数据。绘图沿用服务器 Matplotlib 3.10.0。
+
+最终 Python 类 R08 SHA256：`f9585441690cf8fdf03defa3c2683f590621450ab697be099727774bcbc95ab0`。R06 计时类快照的非空前向与发布类相同；发布类仅追加初始化 cache 源检查和空输入无梯度检查，R08 对全部 100 回放的结果与 R03/R05 完全一致。
+
+[阶段 05 说明](design/05_真实输入回放.md) · [指令](commands/05_真实输入回放.md) · [结果](results/05_真实输入回放.md)。
+
+## 阶段 06/07：双卡 EP 与模型整体评估，2026年10月7日
+
+2026年10月7日，Server-Internet，GPU4/5 两张 RTX 4090D、EP=2；互联 NODE，无 NVLink，CPU Rank0/1 固定到 28/29（NUMA1）。TileLang venv Python 3.13.5、torch 2.9.0+cu128；BF16 autocast、FP32 参数与 GEMM 累加，TF32 关闭，native EP 通信。沿用原 checkpoint / 模型 snapshot 和输入构造；top2 为原 top1 checkpoint 的路由压力实验。
+
+五个负载均为每 Rank：Prefill B1×128 / B8×340 / B32×340；Decode B1×1 / B16×1，固定原 128-token KV 快照；top1/top2 共 10 场景。Prefill / 固定 Decode 保留全部位置 logits 与新 KV 输出，不包含 tokenizer、采样和持续调度。
+
+四条路径：original；全层 kernel9；hybrid（本地总 M≤256 才用 kernel9）；last_layer（仅最后一层且本地 M≤256）。256 是阶段 05 小 M 结果形成的本次候选策略，未宣称适用于所有模型/形状。默认 original。
+
+GPU4 UUID `GPU-290c4b5b-88d6-fffd-344e-0763e6e6d22a`；GPU5 UUID `GPU-cbae796b-9a3d-0154-69c2-2fa382798a4d`。R01阶段06使用GPU1/2时遭外部任务占用OOM，后续阶段06验证和阶段07计时全部换至4/5；两对卡均为NODE拓扑，但正式性能只在同一对4/5做同轮对比。未安装依赖或重编CUDA核心，复用阶段04 dispatcher扩展。
+
+阶段07主测与复测分别有108和32个GPU占用采样，未发现其它计算进程共用4/5；服务器其它GPU任务未处理，未锁频。模型来源SHA/checkpoint SHA与前阶段相同，最终adapter SHA为`403667fa69e8c1ff47cf64725929b52499700671acea3dfa05e48adc5d1a778f`。
+
+正式模型和第7层完整EP：每后端预热20次，5轮轮换，每轮12次，合计60次；切换后端后再预热3次以恢复各自稳态。barrier与计时前同步在区间外，区间为开始Event/墙钟→实际forward→结束Event同步；先按同编号样本取两Rank较慢的wall time，再计算中位数与P95。Event区间含CPU提交空隙，单独保留；不将GPU Event当作纯计算时间。
+
+模型区间包括路由、count exchange、dispatch、原专家或kernel9、元数据、激活、形状变化prepare、combine、attention、全部logits和新KV构建。权重缓存初始化在计时外，2Rank分别8.197/8.066ms；本测量初始化了8层cache，每Rank约171MiB。另记录每场景首次清空工作区的单次前向，不能把单点当分布。
+
+增长KV：从相同原模型128-token KV与首token起点，连续8步，包含argmax与KV推进、logits_to_keep=1，5轮轮换×4块=20个8步块/后端；不含prefix prefill。其算法范围与固定Decode不同，分别呈现。整模型CUDA Graph没有尝试，动态EP已有CPU splits，不宣称可以直接捕获。
+
+阶段06覆盖60个模型候选对照、480个同输入EP对照、36个人工EP边界参考、两Rank训练回退、60个快速/审计一致性对照、自建KV160token/后端和原KV起点B16的512token/后端。原低精度输出的数值失败保留；last_layer在测试范围通过模型准入。未宣称新算子支持反向或整个EP CUDA Graph。
+
+[阶段06](design/06_EP接入验证.md) · [阶段07](design/07_整体性能评估.md)。
+
+## 第三轮算子与KN权重环境（2026-10-07）
+Server-Internet；正式算子GPU4 RTX4090D /114SM，UUID GPU-290c4b5b-88d6-fffd-344e-0763e6e6d22a，CPU28；KN双卡EP另用GPU5/CPU29。Python /data/user4/tongleiwen/tilelang-3032/.venv/bin/python 3.13.5，torch2.9.0+cu128（torch CUDA12.8）；nvcc12.4.99、SCVideo GCC12.4，sm89/O3/C++17、未启用fast-math。TF32关闭；原BF16 reduced-precision=True。诊断时临时关闭归约降精度后立即恢复，默认模型策略不变。
+
+R31动态库SHA256 21f05d63548b9d66d44bf587db827e4b79d16fd2f3b8d1738aeca01c0e5619f4。CUTLASS使用既有三个SM80桥接库；每场景162有效配置组合、6不支持组合，描述符预建，不能以当前头文件commit冒充既有库的构建commit。正式Graph64节点、9轮轮换×10次重放；兼容路径单独7轮×10次eager wall timing，含输出分配与GPU counts同步。正式GPU监控未见其他进程干扰。
+
+NCU再次返回ERR_NVGPUCTRPERM，无硬件指标。KN使用同一模型snapshot/原checkpoint；原SHA256 37f42844c386e8aca7191c8fbcc6f39427da8f45bfb2a016cbf0ca3cbc913d0c。171键、137线性权重、138KN键；输出KN checkpoint SHA256 c2159fbff1813f3c0a60c6272dbc0862e279f1026f111672845c973f7134ccf5。绑定Embedding/输出头共享KN Parameter；其余Embedding/Norm/bias维持语义。单卡10对照+双rank20对照，连续decode共120rank步骤，均原BF16逐位一致。
+
+最终KN保存验收为R08/R09；EP全rank收集，rank0合并完整专家KN参数，逐键恢复原布局及EP重新加载通过。
+
+
+## 第四轮Decode优化环境（2026-10-09）
+仅优化Decode M137 gate/up；Prefill/common.h源码保持第三轮字节一致。继续使用Server-Internet GPU4 / RTX4090D /114SM /CPU28；Python为tilelang-3032的venv 3.13.5，torch2.9.0+cu128，nvcc12.4.99，SCVideo GCC12.4，sm89/O3/C++17、无fast-math。TF32=False，原BF16 reduced-precision=True；手写CUDA与FP32累加参考检查，原BF16兼容单独保留。
+
+正式同轮Graph64节点、9轮轮换、每轮10次重放，Decode计入GPU counts与必要的Split-K归约。CUTLASS每形状扫描device/host/extra配置与0/114/228 CTA三种设置，预建描述符；masked pack/unpack成本另计。NCU既有尝试因权限不足失败，本轮不推断硬件计数器结论。
+
+本轮最终R23库SHA256 `7c8309eb8982e99be779b93da36fa72e4dd94c2fb52a0ec324684be94ed66418`，R24/R25数值、R26/R27计时、R28布局、R29安全23项、R30 CLI7项完成。R26/R27监控无外部GPU进程。
+
+
+## 最新分拆封装与接入环境（2026-10-09）
+Server-Internet，RTX4090D物理GPU4/5、CPU28/29；TileLang venv Python3.13.5、torch2.9.0+cu128/CUDA12.8，SCVideo GCC12.4，nvcc12.4.99，sm89/O3/C++17，ABI=true，无fast-math。原BF16 reduced-precision=True，FP32参考TF32=False。原checkpoint SHA25637f42844c386e8aca7191c8fbcc6f39427da8f45bfb2a016cbf0ca3cbc913d0c；KN SHA256c2159fbff1813f3c0a60c6272dbc0862e279f1026f111672845c973f7134ccf5。
+
+最终API库R16 SHA256 `f2921c3d8dc971b2951a5446ea661f58c455782b7f6c081b27cd2ea7951a9517`；原R01计时库SHA2566bba535283b9058bfb679ca8b3e2985793be0cb94b2e96fd0361c8da18f4dc71，核心CUDA/C++源码相同。模型扩展点SHA256c7a344373dff56099c15cbb45a1880a6990c512adc0f45366a277884451b5a2c，实际本地/服务器/回放快照一致。Prefill/common与第四轮不变，Decode SHA256614ed616e8fc4d3461c82b354f8c4d27833b9e2ebb573b9504fd7f6097054b05。
+
+R02接口100项，R08最终模型与训练回退，R10接口memcheck，R14最终100MLP，R15独立模型测量，R16冻结源码重建与显式Decode额外API，R17实际仓库CLI。R09监控有额外进程，所以正式结论使用R15；R15的106样本只见两个测试Rank。模型参数FP32、BF16 autocast用于基线对照；CLI另外验证BF16参数直接加载及FP16原默认选项。模型wall与MLP Graph/eager计时分开；未锁频、不宣称整机独占、无全EP Graph。未安装新依赖、未训练或改变默认BF16归约。
+
+
+## EP 优化与 6 选 2 compile 训练（2026-10-09）
+Server-Internet；Python3.13.5、torch2.9.0+cu128、CUDA运行时12.8、NCCL2.27.5；SCVideo GCC12.4、nvcc12.4.99、sm89、ABI=true、--fmad=false，无fast-math。模型参数FP32、BF16 autocast、原原生通信和PyTorch专家。最终EP库R27 SHA256 0105cf9ef5171c1680909124c34b5c47c70c0c7ebd04f3358b87845c25204324。
+
+R26小模型多Rank配置检查使用1/2/3/4个Rank，部分设备有其他任务，仅作数值验证。R31最终性能使用空闲物理GPU1/3、CPU28/29，28次占用采样无外部同卡任务，21轮轮换；按对应样本取两Rank较慢walltime再取中位数。输入为固定随机Token、原4专家checkpoint，Top2为同权重路由实验；末位置logits，无采样/分词。Decode固定容量、Prefill compact；原生GEMM有效行数不变。R20环境未确认独占，不用于最终性能结论。
+
+6选2训练使用GPU1/3，原尺寸hidden768/8层/intermediate2432、每Rank batch32/seq340、BF16、AdamW、LR5e-4、累积8、裁剪1、2epochs、workers8，从头训练。动态EP编排留在明确compile边界，张量计算编译；不声明全EP CUDA Graph。旧checkpoint SHA256仍按原记录核查。正式训练要求独立tmux会话，不覆盖原模型。
+
+正式训练启动调整：首次GPU1/3启动后，GPU1新出现user3任务占用约18.31GiB，首批前向OOM，未完成优化器更新。保存失败记录并将会话改名为ep6_top2_compile_20261009_attempt1_oom；正式会话重启在前四张物理卡中的GPU2/3。GPU2与外部任务共享，GPU3没有其他任务；采用原训练设置，不能将共享GPU下正式训练速度作为独占性能基准。

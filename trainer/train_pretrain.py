@@ -6,6 +6,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import datasets  # noqa: F401  # Windows pyarrow/torch DLL conflict workaround (issue #771)
 import argparse
+import json
 import time
 import warnings
 import torch
@@ -65,6 +66,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
+            if args.ep_routing != 'original':
+                Logger(f'Optimized EP calls: {ep_routing_controller.calls}, fallback: {ep_routing_controller.fallbacks}')
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
         should_save = step % args.save_interval == 0 or step == iters
@@ -84,7 +87,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                     epoch=epoch,
                     step=step,
                     wandb=wandb,
-                    save_dir='../checkpoints',
+                    save_dir=args.checkpoint_dir,
                     export_path=ckp,
                 )
             else:
@@ -92,7 +95,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 raw_model = getattr(raw_model, '_orig_mod', raw_model)
                 state_dict = raw_model.state_dict()
                 torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-                lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
+                lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir=args.checkpoint_dir)
                 del state_dict
             model.train()
 
@@ -114,6 +117,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
+    parser.add_argument("--checkpoint_dir", default="../checkpoints", help="完整权重及每Rank恢复状态目录")
     parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
@@ -140,6 +144,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
+    parser.add_argument('--ep_routing', choices=['original','compact','dedup_train'], default='original', help='EP routing implementation; compact supports optimized training')
+    parser.add_argument('--ep_routing_library', default=None, help='built my_cuda_ep.so')
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -150,8 +156,6 @@ if __name__ == "__main__":
             raise RuntimeError('--use_ep训练必须用torchrun启动，并且world_size至少为2')
         if args.num_experts % dist.get_world_size() != 0:
             raise ValueError('num_experts必须能被EP world_size整除')
-        if args.use_compile == 1:
-            raise ValueError('当前动态All-to-All EP暂不支持--use_compile 1')
         args.use_moe = 1
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
     
@@ -167,7 +171,11 @@ if __name__ == "__main__":
         num_experts=args.num_experts,
         num_experts_per_tok=args.num_experts_per_tok,
     )
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
+    if is_main_process():
+        with open(os.path.join(args.save_dir, 'training_config.json'), 'w') as record:
+            json.dump(dict(arguments=vars(args), model=lm_config.to_dict(), torch=torch.__version__,
+                           world_size=dist.get_world_size() if dist.is_initialized() else 1), record, indent=2)
+    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir=args.checkpoint_dir) if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
@@ -190,6 +198,14 @@ if __name__ == "__main__":
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
+    if args.ep_routing != 'original':
+        if not lm_config.use_ep:
+            raise ValueError('optimized EP routing requires --use_ep')
+        from model.ep_routing_backend import attach_ep_routing
+        ep_routing_controller = attach_ep_routing(model, library=args.ep_routing_library,
+                                                  mode=args.ep_routing)
+        Logger('Optimized EP routing enabled for training; native PyTorch experts')
+
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
@@ -201,8 +217,16 @@ if __name__ == "__main__":
     
     # ========== 7. 编译和分布式包装 ==========
     if args.use_compile == 1:
-        model = torch.compile(model)
-        Logger('torch.compile enabled')
+        if lm_config.use_ep:
+            # Dynamic expert selection is a host boundary; tensor compute and
+            # native CUDA routing ops can compile. Keep checkpoint names stable.
+            for layer in model.model.layers:
+                for expert in layer.mlp.experts.values():
+                    expert.compile(dynamic=True, fullgraph=True)
+            model.compile(dynamic=True, fullgraph=False)
+        else:
+            model = torch.compile(model)
+        Logger('torch.compile enabled (dynamic EP host boundaries allowed)')
     if dist.is_initialized() and not lm_config.use_ep:
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
@@ -220,6 +244,15 @@ if __name__ == "__main__":
             train_epoch(epoch, loader, len(loader), 0, wandb)
     
     # ========== 9. 清理分布进程 ==========
+    if args.ep_routing != 'original':
+        summary = dict(rank=dist.get_rank(), optimized_ep_calls=ep_routing_controller.calls,
+                       routing_fallbacks=ep_routing_controller.fallbacks,
+                       peak_memory_bytes=torch.cuda.max_memory_allocated())
+        summaries = [None] * dist.get_world_size() if is_main_process() else None
+        dist.gather_object(summary, summaries, dst=0)
+        if is_main_process():
+            with open(os.path.join(args.save_dir, 'training_summary.json'), 'w') as record:
+                json.dump(dict(completed_epochs=args.epochs, ranks=summaries), record, indent=2)
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()

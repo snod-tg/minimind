@@ -60,8 +60,13 @@ def init_model(args):
             inference_rope_scaling=args.inference_rope_scaling
         ))
         moe_suffix = '_moe' if args.use_moe else ''
-        ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
-        if args.use_ep:
+        ckp = os.path.join(args.save_dir, f'{args.weight}_{args.hidden_size}{moe_suffix}.pth')
+        if args.kn_checkpoint:
+            if args.lora_weight != 'None':
+                raise ValueError('KN checkpoint with unmerged LoRA is unsupported')
+            from model.grouped_gemm_backend import load_kn_model
+            model = load_kn_model(model, args.kn_checkpoint)
+        elif args.use_ep:
             # 完整 MoE checkpoint 含有全部 Expert。先加载到 CPU，再只保留
             # 当前 rank 的共享参数和本地 Expert，避免把远端 Expert 放上 GPU。
             full_state_dict = torch.load(ckp, map_location='cpu')
@@ -89,7 +94,15 @@ def init_model(args):
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     get_model_params(model, model.config)
-    return model.half().eval().to(args.device), tokenizer
+    dtype = torch.bfloat16 if args.model_dtype == 'bf16' else torch.float16
+    model = model.to(device=args.device, dtype=dtype).eval()
+    if args.expert_backend != 'original':
+        if not args.use_ep or args.lora_weight != 'None':
+            raise ValueError('grouped expert backend requires EP and unmerged LoRA is unsupported')
+        from model.grouped_gemm_backend import attach_grouped_backend
+        attach_grouped_backend(model, backend=args.expert_backend,
+                               library=args.grouped_gemm_library)
+    return model, tokenizer
 
 def main():
     parser = argparse.ArgumentParser(description="MiniMind模型推理与对话")
@@ -101,6 +114,12 @@ def main():
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--use_ep', action='store_true', help="启用Expert Parallel；会自动启用MoE，必须使用torchrun启动")
+    parser.add_argument('--expert_backend', default='original',
+                        choices=['original', 'native_bf16', 'cuda_split', 'cuda_split_last_layer'],
+                        help="EP local expert backend; CUDA split uses FP32 accumulation")
+    parser.add_argument('--grouped_gemm_library', default=None, help="built Prefill/Decode PyTorch library")
+    parser.add_argument('--kn_checkpoint', default=None, help='canonical KN checkpoint; skip the original NK checkpoint')
+    parser.add_argument('--model_dtype', choices=['fp16', 'bf16'], default='fp16', help="model inference dtype")
     parser.add_argument('--ep_comm_dtype', choices=['native', 'fp8'], default='native',
                         help="EP dispatch/combine通信精度；fp8使用E4M3压缩，默认保持原精度")
     parser.add_argument('--num_experts', default=4, type=int, help="全局Expert数量")
