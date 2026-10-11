@@ -81,21 +81,49 @@ def sync_ep_shared_parameters(model, group=None):
 
 @torch.no_grad()
 def sync_ep_gradients(model, group=None):
-    """同步共享参数梯度，并对只在本 rank 保存的 Expert 梯度做全局平均。"""
+    """分桶同步共享梯度；本地 Expert 梯度只做全局平均。"""
     if not getattr(model.config, 'use_ep', False):
         return
     group = group if group is not None else dist.group.WORLD
     world_size = dist.get_world_size(group)
-    for name, param in model.named_parameters():
-        if param.grad is None:
+    bucket_bytes = 16 * 1024 * 1024
+
+    def reduce_bucket(grads):
+        # 大参数单独通信，避免额外复制整个 embedding / head。
+        flat = grads[0].contiguous() if len(grads) == 1 else torch.cat([g.reshape(-1) for g in grads])
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=group)
+        flat.div_(world_size)
+        if len(grads) > 1:
+            views = [part.view_as(g) for part, g in zip(flat.split([g.numel() for g in grads]), grads)]
+            torch._foreach_copy_(grads, views)
+        elif flat is not grads[0]:
+            grads[0].copy_(flat)
+
+    for (_, _, expert), grads in _ep_gradient_groups(model).items():
+        if expert:
+            # dispatch 已汇集所有 Rank 的 Token，不能再次 all_reduce Expert。
+            torch._foreach_div_(grads, world_size)
             continue
-        if is_ep_expert_parameter(name):
-            # 每个本地 Expert 已经通过 dispatch 收到了所有 rank 的 Token，
-            # 参数梯度是各 rank loss 梯度之和，只需除以 EP world size。
-            param.grad.div_(world_size)
-        else:
-            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=group)
-            param.grad.div_(world_size)
+        bucket, size = [], 0
+        for grad in grads:
+            nbytes = grad.numel() * grad.element_size()
+            if bucket and size + nbytes > bucket_bytes:
+                reduce_bucket(bucket)
+                bucket, size = [], 0
+            bucket.append(grad)
+            size += nbytes
+        if bucket:
+            reduce_bucket(bucket)
+
+
+def _ep_gradient_groups(model):
+    """按设备、dtype 和专家归属分组；保持参数遍历顺序。"""
+    groups = {}
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            key = (param.grad.device, param.grad.dtype, is_ep_expert_parameter(name))
+            groups.setdefault(key, []).append(param.grad)
+    return groups
 
 
 @torch.no_grad()
@@ -105,20 +133,20 @@ def clip_ep_grad_norm_(model, max_norm, group=None):
     world_size = dist.get_world_size(group)
     device = next(model.parameters()).device
     local_squared_norm = torch.zeros((), dtype=torch.float32, device=device)
-    for name, param in model.named_parameters():
-        if param.grad is None:
-            continue
-        squared_norm = param.grad.detach().float().pow(2).sum()
+    groups = _ep_gradient_groups(model)
+    for (_, dtype, expert), grads in groups.items():
+        # 与原实现一样以 FP32 计算范数，避免 BF16 范数先舍入。
+        norm_grads = [g.float() for g in grads] if dtype == torch.float64 else grads
+        squared_norm = torch.stack(torch._foreach_norm(norm_grads, 2, dtype=torch.float32)).square().sum()
         # 共享梯度在每个 rank 都相同，求全局范数时只计算一份。
-        if not is_ep_expert_parameter(name):
+        if not expert:
             squared_norm.div_(world_size)
         local_squared_norm.add_(squared_norm)
     dist.all_reduce(local_squared_norm, op=dist.ReduceOp.SUM, group=group)
     total_norm = local_squared_norm.sqrt()
     clip_coef = (max_norm / (total_norm + 1e-6)).clamp(max=1.0)
-    for param in model.parameters():
-        if param.grad is not None:
-            param.grad.mul_(clip_coef)
+    for (device, _, _), grads in groups.items():
+        torch._foreach_mul_(grads, clip_coef.to(device))
     return total_norm
 
 
