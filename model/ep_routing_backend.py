@@ -23,19 +23,47 @@ def native_experts(owner,x,counts):
     # Host-dependent empty-expert branch stays outside capture. Each expert's
     # tensor-only forward/backward can still compile with dynamic row count.
     values=[];offset=0
-    for local_id,count in enumerate(counts.tolist()):
+    for local_id,count in enumerate(counts.tolist() if isinstance(counts,torch.Tensor) else counts):
         if count:
             values.append(owner.experts[str(owner.first_expert_id+local_id)](x[offset:offset+count]))
         offset+=count
     output_dtype=torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else x.dtype
     return torch.cat(values) if values else x.to(output_dtype)
 
+
+class _ExpertReturn(torch.autograd.Function):
+    """Attach one autograd node to prelaunched per-expert return exchanges.
+
+    A single backward node keeps collective order identical on every Rank,
+    including when different experts are empty. Backward remains serialized.
+    """
+    @staticmethod
+    def forward(ctx,group,input_splits,output_splits,stream,received,*sent):
+        ctx.group=group;ctx.input_splits=input_splits;ctx.output_splits=output_splits;ctx.stream=stream
+        return tuple(received)
+
+    @staticmethod
+    def backward(ctx,*grad_outputs):
+        compute=torch.cuda.current_stream(grad_outputs[0].device);grads=[]
+        ctx.stream.wait_stream(compute)
+        with torch.cuda.stream(ctx.stream):
+            for grad,send,recv in zip(grad_outputs,ctx.input_splits,ctx.output_splits):
+                grad.record_stream(ctx.stream)
+                value=grad.new_empty((sum(send),*grad.shape[1:]))
+                dist.all_to_all_single(value,grad.contiguous(),output_split_sizes=list(send),
+                    input_split_sizes=list(recv),group=ctx.group)
+                value.record_stream(compute);grads.append(value)
+        compute.wait_stream(ctx.stream)
+        return (None,)*5+tuple(grads)
+
 class MiniMindEPRouting:
-    def __init__(self,model,library,mode='compact'):
+    def __init__(self,model,library,mode='compact',async_counts=True,pipelined_return=False):
         if mode not in ('compact','dedup_train'): raise ValueError('supported modes: compact, dedup_train')
         from my_cuda_kernels.ep_ops import load_library
         load_library(library)
         self.mode=mode;self.enabled=True;self.workspaces={};self.scratch_spaces={};self.calls=0;self.fallbacks=0;self.transport_rows=0;self.original_transport_rows=0
+        self.async_counts=async_counts;self.pipelined_return=pipelined_return
+        self.streams={};self.host_counts={}
         self.layers=[layer.mlp for layer in model.model.layers]
         for i,mlp in enumerate(self.layers):
             if not hasattr(mlp,'local_expert_ids'):raise ValueError('EP model required')
@@ -67,6 +95,68 @@ class MiniMindEPRouting:
         if key not in self.scratch_spaces:self.scratch_spaces[key]=Workspace()
         return self.scratch_spaces[key]
 
+    def comm_stream(self,x):
+        key=(x.device,torch.cuda.current_stream(x.device).cuda_stream)
+        if key not in self.streams:self.streams[key]=torch.cuda.Stream(device=x.device)
+        return self.streams[key]
+
+    def count_table(self,owner,ids,wire_counts):
+        # All shapes are static; scatter avoids bincount's dynamic-size readback.
+        per_expert=torch.zeros(owner.config.num_experts,dtype=torch.int64,device=ids.device)
+        per_expert.scatter_add_(0,ids,torch.ones_like(ids))
+        return torch.cat((wire_counts[:,None],per_expert.view(owner.ep_size,owner.experts_per_rank)),dim=1)
+
+    def exchange_counts(self,owner,x,table):
+        received=torch.empty_like(table)
+        if not self.async_counts:
+            dist.all_to_all_single(received,table,group=owner.process_group)
+            return table,received,None
+        stream=self.comm_stream(x);stream.wait_stream(torch.cuda.current_stream(x.device))
+        key=(x.device,torch.cuda.current_stream(x.device).cuda_stream,tuple(table.shape))
+        if key not in self.host_counts:
+            # A reusable buffer must remain writable after eval -> train.
+            with torch.inference_mode(False):
+                self.host_counts[key]=torch.empty((2,*table.shape),dtype=torch.int64,pin_memory=True)
+        host=self.host_counts[key]
+        with torch.cuda.stream(stream):
+            table.record_stream(stream)
+            dist.all_to_all_single(received,table,group=owner.process_group)
+            host.copy_(torch.stack((table,received)),non_blocking=True)
+            ready=torch.cuda.Event();ready.record(stream)
+        return table,received,(host,ready)
+
+    def read_counts(self,transfer):
+        table,received,ticket=transfer
+        if ticket is None:return table.tolist(),received.tolist()
+        host,ready=ticket;ready.synchronize()
+        return host[0].tolist(),host[1].tolist()
+
+    def return_experts(self,owner,x,counts,sends,recvs,send_inverse):
+        """Keep full expert GEMMs; overlap earlier returns with later experts."""
+        stream=self.comm_stream(x);compute=torch.cuda.current_stream(x.device)
+        sent=[];received=[];events=[];input_splits=[];output_splits=[];offset=0
+        output_dtype=torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else x.dtype
+        for local_id,count in enumerate(counts):
+            with stage('pipeline.expert_compute'):
+                part=x[offset:offset+count]
+                value=owner.experts[str(owner.first_expert_id+local_id)](part) if count else part.to(output_dtype)
+            offset+=count;sent.append(value)
+            send=tuple(row[1+local_id] for row in recvs)
+            recv=tuple(row[1+local_id] for row in sends)
+            input_splits.append(send);output_splits.append(recv)
+            stream.wait_stream(compute)
+            with torch.cuda.stream(stream),stage('pipeline.return_async'):
+                value.record_stream(stream)
+                returned=value.new_empty((sum(recv),value.shape[1]))
+                dist.all_to_all_single(returned,value.detach().contiguous(),
+                    output_split_sizes=list(recv),input_split_sizes=list(send),group=owner.process_group)
+                ready=torch.cuda.Event();ready.record(stream)
+            returned.record_stream(compute);received.append(returned);events.append(ready)
+        returned=_ExpertReturn.apply(owner.process_group,tuple(input_splits),tuple(output_splits),stream,tuple(received),*sent)
+        for ready in events:compute.wait_event(ready)
+        # Per-expert outputs contain source-rank-major rows, as in stable layout.
+        return torch.ops.my_cuda_ep.gather(torch.cat(returned),send_inverse)
+
     @torch.compiler.disable(recursive=False)
     def __call__(self,owner,x,ids,weights,scores=None):
         if not torch.compiler.is_compiling():self.calls+=1
@@ -77,6 +167,11 @@ class MiniMindEPRouting:
         with stage('rank_layout'):
             if owner.training:perm,inverse,send_counts=ws.partition(flat_ids,owner.experts_per_rank,'send',owner.ep_size)
             else:perm,inverse,send_counts=ws.sort(flat_ids,owner.experts_per_rank,'send',owner.ep_size)
+        with stage('counts_exchange'):
+            table=self.count_table(owner,flat_ids,send_counts)
+            transfer=self.exchange_counts(owner,x,table)
+        if self.pipelined_return:
+            _,send_inverse,_=ws.partition(flat_ids[perm]%owner.experts_per_rank,1,'return_map',owner.experts_per_rank)
         with stage('pack'):
             if owner.training:
                 send,send_ids=torch.ops.my_cuda_ep.pack(x,flat_ids,perm,inverse,topk,owner.experts_per_rank)
@@ -84,11 +179,10 @@ class MiniMindEPRouting:
                 send=ws.get('send_x',(n,h),x.dtype,device)
                 send_ids=ws.get('send_ids',(n,),torch.int64,device)
                 torch.ops.my_cuda_ep.pack_out(x,flat_ids,perm,topk,owner.experts_per_rank,send,send_ids)
-        with stage('counts_exchange'):
-            recv_counts=ws.get('recv_counts',(owner.ep_size,),torch.int64,device)
-            dist.all_to_all_single(recv_counts,send_counts,group=owner.process_group)
         with stage('host_splits'):
-            send_splits=tuple(send_counts.tolist());recv_splits=tuple(recv_counts.tolist());r=sum(recv_splits)
+            sends,recvs=self.read_counts(transfer)
+            send_splits=tuple(row[0] for row in sends);recv_splits=tuple(row[0] for row in recvs);r=sum(recv_splits)
+            local_counts=tuple(sum(row[1+e] for row in recvs) for e in range(owner.experts_per_rank))
         with stage('dispatch'):
             if owner.training:recv=owner.communicate(send,recv_splits,send_splits,owner.process_group)
             else:
@@ -105,16 +199,19 @@ class MiniMindEPRouting:
                 sorted_x=ws.get('expert_x',(r,h),x.dtype,device)
                 torch.ops.my_cuda_ep.gather_out(recv,ep_perm,sorted_x)
         handle=RoutingHandle(inverse,ep_inverse,send_splits,recv_splits)
-        with stage('experts'):sorted_y=native_experts(owner,sorted_x,counts)
-        with stage('return'):
-            if owner.training:
-                recv_order=torch.ops.my_cuda_ep.gather(sorted_y,handle.expert_inverse)
-                returned=owner.communicate(recv_order,handle.send_splits,handle.recv_splits,owner.process_group)
-            else:
-                recv_order=ws.get('recv_order_y',(r,h),sorted_y.dtype,device)
-                torch.ops.my_cuda_ep.gather_out(sorted_y,handle.expert_inverse,recv_order)
-                returned=ws.get('returned_y',(n,h),sorted_y.dtype,device)
-                dist.all_to_all_single(returned,recv_order,output_split_sizes=list(handle.send_splits),input_split_sizes=list(handle.recv_splits),group=owner.process_group)
+        if self.pipelined_return:
+            returned=self.return_experts(owner,sorted_x,local_counts,sends,recvs,send_inverse)
+        else:
+            with stage('experts'):sorted_y=native_experts(owner,sorted_x,local_counts)
+            with stage('return'):
+                if owner.training:
+                    recv_order=torch.ops.my_cuda_ep.gather(sorted_y,handle.expert_inverse)
+                    returned=owner.communicate(recv_order,handle.send_splits,handle.recv_splits,owner.process_group)
+                else:
+                    recv_order=ws.get('recv_order_y',(r,h),sorted_y.dtype,device)
+                    torch.ops.my_cuda_ep.gather_out(sorted_y,handle.expert_inverse,recv_order)
+                    returned=ws.get('returned_y',(n,h),sorted_y.dtype,device)
+                    dist.all_to_all_single(returned,recv_order,output_split_sizes=list(handle.send_splits),input_split_sizes=list(handle.recv_splits),group=owner.process_group)
         with stage('combine'):
             if owner.training:
                 out=torch.ops.my_cuda_ep.combine(returned,weights.reshape(-1),handle.assignment_inverse,topk,(torch.float32,torch.float16,torch.bfloat16).index(x.dtype))
@@ -140,17 +237,19 @@ class MiniMindEPRouting:
             unique_counts=ws.get('unique_counts',(owner.ep_size,),torch.int64,device)
             torch.ops.my_cuda_ep.dedup_flags_out(flat_ids,perm,experts,flags,unique_counts)
             prefix=torch.cumsum(flags,dim=0,dtype=torch.int64)
+        with stage('counts_exchange'):
+            table=self.count_table(owner,flat_ids,unique_counts)
+            transfer=self.exchange_counts(owner,x,table)
+        if self.pipelined_return:
+            _,send_inverse,_=ws.partition(flat_ids[perm]%experts,1,'return_map',experts)
         with stage('pack'):
             send,metadata,_=torch.ops.my_cuda_ep.dedup_pack(x,flat_ids,perm,flags,prefix,experts,bits)
-        with stage('counts_exchange'):
-            table=torch.stack((unique_counts,assignment_counts),dim=1)
-            received=torch.empty_like(table)
-            dist.all_to_all_single(received,table,group=owner.process_group)
         with stage('host_splits'):
-            sends=table.tolist();recvs=received.tolist()
+            sends,recvs=self.read_counts(transfer)
             send_unique=tuple(v[0] for v in sends);recv_unique=tuple(v[0] for v in recvs)
-            send_expanded=tuple(v[1] for v in sends);recv_expanded=tuple(v[1] for v in recvs)
+            send_expanded=tuple(sum(v[1:]) for v in sends);recv_expanded=tuple(sum(v[1:]) for v in recvs)
             total_send=sum(send_unique);total_recv=sum(recv_unique);expanded=sum(recv_expanded)
+            local_counts=tuple(sum(row[1+e] for row in recvs) for e in range(experts))
         with stage('dispatch'):
             recv=owner.communicate(send[:total_send],recv_unique,send_unique,owner.process_group)
             recv_meta=torch.empty((total_recv,),dtype=torch.int64,device=device)
@@ -164,10 +263,13 @@ class MiniMindEPRouting:
             # No expanded payload intermediary: one gather reads unique recv.
             sorted_x=torch.ops.my_cuda_ep.expand(recv,wire[ep_perm])
         handle=RoutingHandle(inverse,ep_inverse,send_expanded,recv_expanded)
-        with stage('experts'):sorted_y=native_experts(owner,sorted_x,counts)
-        with stage('return'):
-            recv_order=torch.ops.my_cuda_ep.gather(sorted_y,handle.expert_inverse)
-            returned=owner.communicate(recv_order,handle.send_splits,handle.recv_splits,owner.process_group)
+        if self.pipelined_return:
+            returned=self.return_experts(owner,sorted_x,local_counts,sends,recvs,send_inverse)
+        else:
+            with stage('experts'):sorted_y=native_experts(owner,sorted_x,local_counts)
+            with stage('return'):
+                recv_order=torch.ops.my_cuda_ep.gather(sorted_y,handle.expert_inverse)
+                returned=owner.communicate(recv_order,handle.send_splits,handle.recv_splits,owner.process_group)
         with stage('combine'):
             out=torch.ops.my_cuda_ep.combine(returned,weights.reshape(-1),handle.assignment_inverse,2,(torch.float32,torch.float16,torch.bfloat16).index(x.dtype))
         owner.aux_loss=moe_aux_loss(scores,ids,owner.config,owner.process_group) if owner.training and owner.config.router_aux_loss_coef>0 else weights.new_zeros(())
@@ -178,9 +280,9 @@ class MiniMindEPRouting:
     def uninstall(self):
         for mlp in self.layers:
             del mlp._ep_routing_backend;del mlp._ep_routing_layer
-        self.workspaces.clear();self.scratch_spaces.clear()
+        self.workspaces.clear();self.scratch_spaces.clear();self.streams.clear();self.host_counts.clear()
 
 
-def attach_ep_routing(model, *, library=None, mode='compact'):
+def attach_ep_routing(model, *, library=None, mode='compact',async_counts=True,pipelined_return=False):
     """Attach optimized routing without changing native expert computation."""
-    return MiniMindEPRouting(model, library, mode)
+    return MiniMindEPRouting(model, library, mode,async_counts,pipelined_return)

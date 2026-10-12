@@ -146,6 +146,8 @@ if __name__ == "__main__":
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
     parser.add_argument('--ep_routing', choices=['original','compact','dedup_train'], default='original', help='EP routing implementation; compact supports optimized training')
     parser.add_argument('--ep_routing_library', default=None, help='built my_cuda_ep.so')
+    parser.add_argument('--ep_async_counts',default=1,type=int,choices=[0,1],help='异步读取完整专家计数')
+    parser.add_argument('--ep_pipelined_return',default=0,type=int,choices=[0,1],help='按完整专家流水回传；先用于 Prefill 验证')
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
@@ -203,7 +205,8 @@ if __name__ == "__main__":
             raise ValueError('optimized EP routing requires --use_ep')
         from model.ep_routing_backend import attach_ep_routing
         ep_routing_controller = attach_ep_routing(model, library=args.ep_routing_library,
-                                                  mode=args.ep_routing)
+            mode=args.ep_routing,async_counts=bool(args.ep_async_counts),
+            pipelined_return=bool(args.ep_pipelined_return))
         Logger('Optimized EP routing enabled for training; native PyTorch experts')
 
     # ========== 6. 从ckp恢复状态 ==========
@@ -246,6 +249,8 @@ if __name__ == "__main__":
     # ========== 9. 清理分布进程 ==========
     if args.ep_routing != 'original':
         summary = dict(rank=dist.get_rank(), optimized_ep_calls=ep_routing_controller.calls,
+                       async_counts=ep_routing_controller.async_counts,
+                       pipelined_return=ep_routing_controller.pipelined_return,
                        routing_fallbacks=ep_routing_controller.fallbacks,
                        peak_memory_bytes=torch.cuda.max_memory_allocated())
         summaries = [None] * dist.get_world_size() if is_main_process() else None

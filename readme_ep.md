@@ -17,6 +17,10 @@
 
 优化路径保留 Router 的 softmax / Top-K，以及逐专家返回、权重乘法和合并时的 BF16 舍入顺序。去重主要减少输入派发及对应反向传输，输出仍按专家分配返回。每次前向重新计算路由；反向使用的映射属于本次前向，缓冲区复用只缓存空间。
 
+计数交换附带完整专家分配数，直接推导本地专家切片，省掉专家分组后的 CPU 读数；计数异步复制到可复用的固定页缓冲，与打包重叠。仍需在使用动态 NCCL splits 前等待对应 Event，这不是完全无 CPU 同步的路径。
+
+可选的按专家回传流水保留每个专家完整的 GEMM 形状及行顺序，让已完成专家的输出回传与后续专家计算重叠。反向用单一 autograd 节点固定各 Rank 的通信顺序，本轮反向仍串行。因未取得额外端到端收益，流水默认关闭。
+
 ## 安装优化路由依赖
 
 MiniMind 负责模型、NCCL 编排、梯度同步和模型保存；[my_cuda_kernels](https://github.com/snod-tg/fused_residual_rmsnorm_kernel) 提供通用 CUDA 打包、展开、合并及 autograd 算子。两项目通过 Python 包调用关联。
@@ -51,6 +55,8 @@ python -m torch.distributed.run --standalone --nproc_per_node=2 train_pretrain.p
 
 调整专家数 / Top-K 使用对应参数；Top-K 大于 2 时选择 `compact`。全量微调沿用 `trainer/train_full_sft.py --use_ep` 的原生 EP 支持。模型 compile 使用原 `--use_compile` 开关；动态 splits 和专家空分支存在编译边界，不能将其称为完整 EP 的 fullgraph 捕获。
 
+优化预训练默认 `--ep_async_counts 1 --ep_pipelined_return 0`。测试按专家回传流水时显式指定 `--ep_pipelined_return 1`；各 Rank 的开关必须一致。
+
 训练在优化器更新时同步共享参数梯度：按设备和 dtype 分组，以 16 MiB 为桶容量合并 All-Reduce，超大参数单独通信；本地专家梯度只除以 EP Rank 数。全局裁剪批量计算 FP32 范数并缩放梯度，共享参数计一份、专家参数计入各 Rank 的分片。归约顺序可能带来 FP32 末位差异，专家计算与 BF16 autocast 规则保持原样。
 
 保存完整 MoE 权重，同时为各 Rank 保存独立前缀的恢复状态；续训须匹配专家数、Top-K 和 EP 拓扑。优化训练条件不满足时显式报错，禁止静默回退。
@@ -70,7 +76,8 @@ CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.run --standalone --nproc_pe
 ```python
 from model.ep_routing_backend import attach_ep_routing
 
-controller = attach_ep_routing(model, mode="compact")  # Top-2 也可选 dedup_train
+controller = attach_ep_routing(model, mode="compact", async_counts=True,
+                               pipelined_return=False)  # Top-2 也可选 dedup_train
 # 推理使用 model.eval()、torch.inference_mode() 和所需的 autocast。
 # 训练使用正常的 autograd；CUDA 算子已注册反向。
 controller.uninstall()
@@ -86,10 +93,10 @@ controller.uninstall()
 
 | 方案 | 有效 Token/s | 秒 / 更新 | 峰值 allocated / Rank | 峰值 reserved / Rank |
 | --- | ---: | ---: | ---: | ---: |
-| 无 EP DDP | 73,327 | 1.4566 | 13.323 GiB | 14.543 GiB |
-| 最新 Top-2 去重 EP | 72,515 | 1.4739 | 10.151 GiB | 13.348 GiB |
+| 无 EP DDP | 73,065 | 1.4489 | 13.329 GiB | 14.574 GiB |
+| 最新 Top-2 去重 EP（异步完整计数） | 72,956 | 1.4640 | 10.163 GiB | 13.350 GiB |
 
-EP 吞吐约为 DDP 的 **98.89%**，峰值 allocated 降低 **23.80%**，主要来自专家与优化器分片。同轮旧 EP 对照中，分桶同步从 7.214 ms 降到 6.314 ms，批量裁剪从 3.046 ms 降到 1.906 ms，分别降低 12.48% / 37.43%；整体吞吐基本持平（−0.06%）。局部开销减少尚未体现为整网加速。该结果是短训练窗口，排除初始化、预热和保存，不能作为完整两轮训练耗时或模型质量结论。
+EP 吞吐约为 DDP 的 **99.85%**，峰值 allocated 降低 **23.75%**，主要来自专家与优化器分片。同轮当前 EP 对照中，完整异步计数方案的中位吞吐提高 **0.99%**（同轮配对提升中位数 1.24%）。回传流水虽有实际 GPU 重叠，仍略慢于仅优化计数的方案，未作为默认路径。该结果是短训练窗口，排除初始化、预热和保存，不能作为完整两轮训练耗时或模型质量结论；当前也未证明比无 EP DDP 更快。
 
 性能基线使用当前代码的无 EP DDP 路径，统一设为原非 EP 的 `local_topk_sum` 辅助损失。代码兼容检查另外直接读取 `89d674b` 的原模型；两种基线分别对应性能测量和源码回归。正式训练入口继续保留已有辅助损失默认值。
 
@@ -104,5 +111,7 @@ EP 吞吐约为 DDP 的 **98.89%**，峰值 allocated 降低 **23.80%**，主要
 本次目录整理验证默认非 EP 的 CPU FP32 Dense、MoE Top-1 / Top-2 与 `89d674b` 的输出、损失、梯度逐位一致，并核对最新优化路径的计算逻辑未改变。BF16 多次更新轨迹的严格重复性和模型质量需要独立评估。
 
 梯度优化验收：本地与服务器 CPU 回归各 13 项通过；每 Rank 的 24 类 CUDA 梯度契约与 10 类路由边界通过。两层模型新旧 EP 同步梯度最大差异为 0，范数差异不超过 1.20e-7，两次 AdamW 更新后的参数差异不超过 7.46e-9；两种 EP 也分别通过无 EP DDP 对照。9 个 BF16 性能窗口损失与梯度范数均有限，优化 EP 回退均为 0，选定 GPU 无其他任务混入。
+
+计数 / 回传优化验收：每 Rank 12 类路由边界 × 6 条参考与候选路径通过，含空专家、空来源和不等长输入；6 专家 Top-1/2/3/6 的全模型、BF16 值 / 梯度、推理到训练切换共 164 项检查通过。三种 EP 与 DDP 分别通过 FP32 梯度及两次 AdamW 更新对照；12 个 BF16 性能窗口均有限、零回退、选定 GPU 无外部任务混入。单独 profiler 确认前向专家 GEMM 与回传 NCCL 的区间重叠，反向及整体吞吐不据此推算。
 
 当前动态通信仍有 CPU 读取 counts 的同步；未实现通信与计算重叠。后续收益需在相同模型、数据、精度、损失及同步条件下重新验收。
