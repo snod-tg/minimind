@@ -32,30 +32,57 @@ def native_experts(owner,x,counts):
 
 
 class _ExpertReturn(torch.autograd.Function):
-    """Attach one autograd node to prelaunched return bucket exchanges.
-
-    A single backward node keeps collective order identical on every Rank,
-    including when different experts are empty. Backward remains serialized.
-    """
+    """Keep collective order fixed; overlap expert backward with later returns."""
     @staticmethod
-    def forward(ctx,group,input_splits,output_splits,stream,received,*sent):
+    def forward(ctx,group,input_splits,output_splits,stream,received,records,layouts,x,*params):
         ctx.group=group;ctx.input_splits=input_splits;ctx.output_splits=output_splits;ctx.stream=stream
+        ctx.records=records;ctx.layouts=layouts;ctx.params=params;ctx.input_shape=x.shape;ctx.used=False
         return tuple(received)
 
     @staticmethod
+    @torch.autograd.function.once_differentiable
     def backward(ctx,*grad_outputs):
-        compute=torch.cuda.current_stream(grad_outputs[0].device);grads=[]
+        if ctx.used:raise RuntimeError('expert pipeline supports one backward per forward')
+        ctx.used=True
+        compute=torch.cuda.current_stream(grad_outputs[0].device)
         ctx.stream.wait_stream(compute)
+        # Each row has one destination. Reassemble complete expert gradients
+        # before its GEMM, preserving BF16 weight-gradient reduction shapes.
+        expert_grads={};ready={}
         with torch.cuda.stream(ctx.stream):
-            for grad,send,recv in zip(grad_outputs,ctx.input_splits,ctx.output_splits):
+            for grad,send,recv,layout in zip(grad_outputs,ctx.input_splits,ctx.output_splits,ctx.layouts):
                 grad.record_stream(ctx.stream)
                 value=grad.new_empty((sum(send),*grad.shape[1:]))
                 with stage('pipeline.backward_return'):
                     dist.all_to_all_single(value,grad.contiguous(),output_split_sizes=list(send),
                         input_split_sizes=list(recv),group=ctx.group)
-                value.record_stream(compute);grads.append(value)
-        compute.wait_stream(ctx.stream)
-        return (None,)*5+tuple(grads)
+                offset=0
+                for expert,start,end in layout:
+                    if expert not in expert_grads:
+                        expert_grads[expert]=torch.empty_like(ctx.records[expert][1])
+                        expert_grads[expert].record_stream(compute)
+                    expert_grads[expert][start:end].copy_(value[offset:offset+end-start])
+                    offset+=end-start
+                    event=torch.cuda.Event();event.record(ctx.stream);ready[expert]=event
+        # All transfers have been submitted, but compute waits only for the
+        # current expert. Later transfers continue while its backward runs.
+        input_grads=[];parameter_grads=[None]*len(ctx.params)
+        indices={id(p):i for i,p in enumerate(ctx.params)}
+        for expert,(part,output,params) in enumerate(ctx.records):
+            if output is None:
+                input_grads.append(torch.zeros_like(part));continue
+            compute.wait_event(ready[expert])
+            with stage('pipeline.expert_backward'):
+                grads=torch.autograd.grad(output,(part,*params),expert_grads.pop(expert),
+                    retain_graph=False,allow_unused=True)
+            input_grads.append(grads[0])
+            for param,grad in zip(params,grads[1:]):
+                i=indices[id(param)]
+                parameter_grads[i]=grad if parameter_grads[i] is None else parameter_grads[i]+grad
+        # Release consumed activation graphs before lower layers run backward.
+        ctx.records=();ctx.layouts=()
+        dx=torch.cat(input_grads) if input_grads else grad_outputs[0].new_zeros(ctx.input_shape)
+        return (None,)*7+(dx,*parameter_grads)
 
 class MiniMindEPRouting:
     def __init__(self,model,library,mode='compact',async_counts=True,pipelined_return=False,return_bucket_bytes=16*1024*1024):
@@ -179,11 +206,12 @@ class MiniMindEPRouting:
         for e,count in enumerate(counts):
             offsets.append(offsets[-1]+count)
             send_offsets.append(send_offsets[-1]+sum(row[1+e] for row in sends))
-        values=[];sent=[];received=[];input_splits=[];output_splits=[];maps=[]
+        values=[];records=[];layouts=[];received=[];input_splits=[];output_splits=[];maps=[]
+        training=torch.is_grad_enabled()
         for bucket,cursors in plan:
             send=tuple(bucket[rank]);recv=tuple(bucket[peer][rank] for peer in range(owner.ep_size))
             with stage('pipeline.bucket_schedule'):
-                parts=[]
+                parts=[];layout=[]
                 for peer in range(owner.ep_size):
                     lo=cursors[rank][peer];hi=lo+send[peer];peer_offset=0
                     map_lo=cursors[peer][rank];map_hi=map_lo+recv[peer];map_offset=0
@@ -197,9 +225,18 @@ class MiniMindEPRouting:
                                 i=len(values)
                                 with stage('pipeline.expert_compute'):
                                     part=x[offsets[i]:offsets[i+1]]
-                                    values.append(owner.experts[str(owner.first_expert_id+i)](part) if counts[i] else part.to(dtype))
+                                    module=owner.experts[str(owner.first_expert_id+i)]
+                                    if training:
+                                        # Keep a non-leaf view like the native slice. Autocast
+                                        # must not cache one BF16 input cast across gate/up.
+                                        part=part.detach().requires_grad_(True).view_as(part)
+                                    output=module(part) if counts[i] else part.to(dtype)
+                                    values.append(output)
+                                    records.append((part,output if counts[i] else None,
+                                        tuple(p for p in module.parameters() if p.requires_grad)))
                             expert_start=sum(row[1+e] for row in recvs[:peer])+start-peer_offset
                             parts.append(values[e][expert_start:expert_start+end-start])
+                            layout.append((e,expert_start,expert_start+end-start))
                         peer_offset+=length
                         length=sends[peer][1+e]
                         start=max(map_lo,map_offset);end=min(map_hi,map_offset+length)
@@ -207,9 +244,9 @@ class MiniMindEPRouting:
                             map_start=send_offsets[e]+sum(row[1+e] for row in sends[:peer])+start-map_offset
                             maps.append(send_perm[map_start:map_start+end-start])
                         map_offset+=length
-            with stage('pipeline.bucket_pack'):
+            with torch.no_grad(),stage('pipeline.bucket_pack'):
                 value=torch.cat(parts) if parts else x[:0].to(dtype)
-            sent.append(value);input_splits.append(send);output_splits.append(recv)
+            layouts.append(layout);input_splits.append(send);output_splits.append(recv)
             actual=max(sum(send),sum(recv))*row_bytes
             assert actual<=self.return_bucket_bytes
             self.max_return_bytes=max(self.max_return_bytes,actual);self.return_calls+=1
@@ -221,12 +258,19 @@ class MiniMindEPRouting:
                     input_split_sizes=list(send),group=owner.process_group)
             returned.record_stream(compute);received.append(returned)
         with stage('pipeline.restore'):
-            returned=_ExpertReturn.apply(owner.process_group,tuple(input_splits),tuple(output_splits),stream,tuple(received),*sent)
+            # Include empty trailing experts so the returned input gradient has
+            # the full shape and parameter edges stay stable across iterations.
+            while len(records)<experts:
+                i=len(records);part=x[offsets[i]:offsets[i+1]]
+                records.append((part,None,()))
+            params=tuple(dict.fromkeys(p for _,_,ps in records for p in ps))
+            returned=_ExpertReturn.apply(owner.process_group,tuple(input_splits),tuple(output_splits),
+                stream,tuple(received),tuple(records),tuple(layouts),x,*params)
             wire_perm=torch.cat(maps) if maps else send_perm[:0]
             inverse=torch.empty_like(wire_perm)
             inverse.scatter_(0,wire_perm,torch.arange(len(wire_perm),device=x.device,dtype=torch.int64))
             compute.wait_stream(stream)
-            self.last_return_buckets=len(sent)
+            self.last_return_buckets=len(received)
             return torch.ops.my_cuda_ep.gather(torch.cat(returned),inverse)
 
     @torch.compiler.disable(recursive=False)

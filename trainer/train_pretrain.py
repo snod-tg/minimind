@@ -20,7 +20,7 @@ from dataset.lm_dataset import PretrainDataset
 from trainer.trainer_utils import (
     get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode,
     setup_seed, init_model, SkipBatchSampler, sync_ep_gradients,
-    clip_ep_grad_norm_
+    clip_ep_grad_norm_, EPGradientSync
 )
 
 warnings.filterwarnings('ignore')
@@ -42,6 +42,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
+        if args.ep_overlap_grad and (step % args.accumulation_steps == 0 or step == iters):
+            ep_gradient_sync.arm()
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0:
@@ -147,7 +149,8 @@ if __name__ == "__main__":
     parser.add_argument('--ep_routing', choices=['original','compact','dedup_train'], default='original', help='EP routing implementation; compact supports optimized training')
     parser.add_argument('--ep_routing_library', default=None, help='built my_cuda_ep.so')
     parser.add_argument('--ep_async_counts',default=1,type=int,choices=[0,1],help='异步读取完整专家计数')
-    parser.add_argument('--ep_pipelined_return',default=0,type=int,choices=[0,1],help='按完整专家流水回传；先用于 Prefill 验证')
+    parser.add_argument('--ep_pipelined_return',default=0,type=int,choices=[0,1],help='按完整专家流水回传，重叠前向与反向通信')
+    parser.add_argument('--ep_overlap_grad',default=0,type=int,choices=[0,1],help='按梯度就绪事件与反向尾部重叠共享梯度归约')
     parser.add_argument('--ep_grad_bucket_mib',default=16,type=int,help='共享梯度通信桶容量 MiB')
     parser.add_argument('--ep_return_bucket_mib',default=16,type=int,help='专家回传通信桶容量 MiB')
     args = parser.parse_args()
@@ -213,6 +216,10 @@ if __name__ == "__main__":
             pipelined_return=bool(args.ep_pipelined_return),return_bucket_bytes=args.ep_return_bucket_mib*1024*1024)
         Logger('Optimized EP routing enabled for training; native PyTorch experts')
 
+    if args.ep_overlap_grad:
+        if not lm_config.use_ep:raise ValueError('--ep_overlap_grad requires --use_ep')
+        ep_gradient_sync=EPGradientSync(model)
+
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
@@ -254,6 +261,7 @@ if __name__ == "__main__":
     if args.ep_routing != 'original':
         summary = dict(rank=dist.get_rank(), optimized_ep_calls=ep_routing_controller.calls,
                        async_counts=ep_routing_controller.async_counts,
+                       overlap_grad=bool(args.ep_overlap_grad),
                        pipelined_return=ep_routing_controller.pipelined_return,
                        return_bucket_mib=args.ep_return_bucket_mib,grad_bucket_mib=args.ep_grad_bucket_mib,
                        routing_fallbacks=ep_routing_controller.fallbacks,

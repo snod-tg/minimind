@@ -5,6 +5,7 @@ import os
 import sys
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from contextlib import nullcontext
 import random
 import math
 import numpy as np
@@ -84,6 +85,10 @@ def sync_ep_gradients(model, group=None, bucket_bytes=16 * 1024 * 1024):
     """分桶同步共享梯度；本地 Expert 梯度只做全局平均。"""
     if not getattr(model.config, 'use_ep', False):
         return
+    overlap = getattr(model, '_ep_gradient_sync', None)
+    if overlap is not None:
+        overlap.finish(bucket_bytes)
+        return
     group = group if group is not None else dist.group.WORLD
     world_size = dist.get_world_size(group)
     if bucket_bytes <= 0:
@@ -115,6 +120,87 @@ def sync_ep_gradients(model, group=None, bucket_bytes=16 * 1024 * 1024):
             size += nbytes
         if bucket:
             reduce_bucket(bucket)
+
+
+class EPGradientSync:
+    """Launch fixed-order reductions after backward's CPU submissions finish.
+
+    Hooks record readiness only. They never launch collectives, so dynamic
+    expert loads cannot reorder shared reductions against EP communication.
+    """
+    def __init__(self,model,group=None):
+        if getattr(model,'_ep_gradient_sync',None) is not None:
+            raise RuntimeError('EP gradient overlap already attached')
+        self.model=model;self.group=group if group is not None else dist.group.WORLD
+        self.params=[(name,p) for name,p in model.named_parameters()
+            if p.requires_grad and not is_ep_expert_parameter(name)]
+        device=next(model.parameters()).device
+        self.stream=torch.cuda.Stream(device=device);self.ready={};self.buffers={};self.armed=False;self.seen=set()
+        self.hooks=[p.register_post_accumulate_grad_hook(self.record) for _,p in self.params]
+        model._ep_gradient_sync=self
+
+    def arm(self):
+        if self.armed:raise RuntimeError('gradient overlap already armed')
+        self.armed=True;self.seen.clear()
+
+    def record(self,param):
+        if not self.armed:return
+        self.seen.add(param)
+        # Reusing the event is safe: each update joins communication before
+        # clipping/AdamW, and only the latest accumulated gradient is reduced.
+        if param not in self.ready:self.ready[param]=torch.cuda.Event()
+        self.ready[param].record(torch.cuda.current_stream(param.device))
+
+    @torch.no_grad()
+    def finish(self,bucket_bytes):
+        if bucket_bytes<=0:raise ValueError('gradient bucket size must be positive')
+        if not self.armed:raise RuntimeError('arm gradient overlap before the final backward')
+        self.armed=False
+        world=dist.get_world_size(self.group)
+        compute=torch.cuda.current_stream(next(self.model.parameters()).device)
+        buckets=[];bucket=[];size=0;key=None
+        # Reverse model order reduces upper-layer gradients first; the tied
+        # embedding/head gradient is ready last and must not block every bucket.
+        for _,p in reversed(self.params):
+            if p.grad is None:continue
+            if p not in self.seen:
+                # A parameter used only by an earlier microbatch has no final
+                # hook. Its gradient is valid; join the complete compute tail.
+                if p not in self.ready:self.ready[p]=torch.cuda.Event()
+                self.ready[p].record(compute)
+            current=(p.grad.device,p.grad.dtype);nbytes=p.grad.numel()*p.grad.element_size()
+            if bucket and (current!=key or size+nbytes>bucket_bytes):
+                buckets.append(bucket);bucket=[];size=0
+            key=current;bucket.append(p);size+=nbytes
+        if bucket:buckets.append(bucket)
+        with torch.cuda.stream(self.stream):
+            for index,params in enumerate(buckets):
+                grads=[p.grad for p in params]
+                for p in params:
+                    self.stream.wait_event(self.ready[p]);p.grad.record_stream(self.stream)
+                views=None
+                if len(grads)==1 and grads[0].is_contiguous():
+                    flat=grads[0]
+                else:
+                    count=sum(g.numel() for g in grads);key=(index,grads[0].dtype,grads[0].device)
+                    flat=self.buffers.get(key)
+                    if flat is None or flat.numel()!=count:
+                        flat=torch.empty(count,dtype=grads[0].dtype,device=grads[0].device)
+                        self.buffers[key]=flat
+                    views=[part.view_as(g) for part,g in zip(flat.split([g.numel() for g in grads]),grads)]
+                    torch._foreach_copy_(views,grads)
+                with torch.profiler.record_function('ep.shared_gradient_reduce') if os.environ.get('MINIMIND_EP_PROFILE')=='1' else nullcontext():
+                    dist.all_reduce(flat,op=dist.ReduceOp.SUM,group=self.group)
+                flat.div_(world)
+                if views is not None:torch._foreach_copy_(grads,views)
+        for (_,_,expert),grads in _ep_gradient_groups(self.model).items():
+            if expert:torch._foreach_div_(grads,world)
+        compute.wait_stream(self.stream)
+
+    def uninstall(self):
+        for hook in self.hooks:hook.remove()
+        del self.model._ep_gradient_sync
+        self.ready.clear();self.buffers.clear()
 
 
 def _ep_gradient_groups(model):
