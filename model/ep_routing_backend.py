@@ -50,8 +50,9 @@ class _ExpertReturn(torch.autograd.Function):
             for grad,send,recv in zip(grad_outputs,ctx.input_splits,ctx.output_splits):
                 grad.record_stream(ctx.stream)
                 value=grad.new_empty((sum(send),*grad.shape[1:]))
-                dist.all_to_all_single(value,grad.contiguous(),output_split_sizes=list(send),
-                    input_split_sizes=list(recv),group=ctx.group)
+                with stage('pipeline.backward_return'):
+                    dist.all_to_all_single(value,grad.contiguous(),output_split_sizes=list(send),
+                        input_split_sizes=list(recv),group=ctx.group)
                 value.record_stream(compute);grads.append(value)
         compute.wait_stream(ctx.stream)
         return (None,)*5+tuple(grads)
@@ -140,36 +141,39 @@ class MiniMindEPRouting:
         return rows[0],rows[1],None
 
     def return_plan(self,global_tables,row_bytes):
-        """Fill buckets across experts; cap both directions for backward too."""
+        """Return each complete expert in capacity-bounded communication buckets."""
         capacity=self.return_bucket_bytes//row_bytes
         if capacity<1:raise ValueError('return bucket must fit one output row')
-        ranks=len(global_tables)
-        # Matrix: expert-owner rank -> original token rank.
-        remaining=[[sum(global_tables[peer][r][1:]) for peer in range(ranks)] for r in range(ranks)]
+        ranks=len(global_tables);experts=len(global_tables[0][0])-1
         cursors=[[0]*ranks for _ in range(ranks)];plan=[]
-        while not plan or any(any(row) for row in remaining):
-            send_room=[capacity]*ranks;recv_room=[capacity]*ranks
-            bucket=[[0]*ranks for _ in range(ranks)]
-            for source in range(ranks):
-                for peer in range(ranks):
-                    count=min(remaining[source][peer],send_room[source],recv_room[peer])
-                    bucket[source][peer]=count;remaining[source][peer]-=count
-                    send_room[source]-=count;recv_room[peer]-=count
-            plan.append((bucket,[row.copy() for row in cursors]))
-            for source in range(ranks):
-                for peer in range(ranks):cursors[source][peer]+=bucket[source][peer]
-        return plan
+        for expert in range(experts):
+            remaining=[[global_tables[peer][r][1+expert]
+                for peer in range(ranks)] for r in range(ranks)]
+            # Empty experts need no collective; every rank uses the same table.
+            while any(any(row) for row in remaining):
+                send_room=[capacity]*ranks;recv_room=[capacity]*ranks
+                bucket=[[0]*ranks for _ in range(ranks)]
+                for source in range(ranks):
+                    for peer in range(ranks):
+                        count=min(remaining[source][peer],send_room[source],recv_room[peer])
+                        bucket[source][peer]=count;remaining[source][peer]-=count
+                        send_room[source]-=count;recv_room[peer]-=count
+                plan.append((bucket,[row.copy() for row in cursors]))
+                for source in range(ranks):
+                    for peer in range(ranks):cursors[source][peer]+=bucket[source][peer]
+        return plan or [([[0]*ranks for _ in range(ranks)],cursors)]
 
     def return_experts(self,owner,x,counts,sends,recvs,send_perm,global_tables):
         """Pack output buckets directly from complete expert GEMMs.
 
-        Cross expert boundaries when filling a bucket. Compute each expert
-        once, in original order, when its first output slice is needed.
+        Compute each expert once in original order. Return its output before
+        computing the next expert; split only communication at bucket capacity.
         """
         stream=self.comm_stream(x);compute=torch.cuda.current_stream(x.device)
         dtype=torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else x.dtype
         row_bytes=x.shape[1]*torch.empty((),dtype=dtype).element_size()
-        plan=self.return_plan(global_tables,row_bytes)
+        with stage('pipeline.plan'):
+            plan=self.return_plan(global_tables,row_bytes)
         rank=dist.get_rank(owner.process_group);experts=owner.experts_per_rank
         offsets=[0];send_offsets=[0]
         for e,count in enumerate(counts):
@@ -178,31 +182,33 @@ class MiniMindEPRouting:
         values=[];sent=[];received=[];input_splits=[];output_splits=[];maps=[]
         for bucket,cursors in plan:
             send=tuple(bucket[rank]);recv=tuple(bucket[peer][rank] for peer in range(owner.ep_size))
-            parts=[]
-            for peer in range(owner.ep_size):
-                lo=cursors[rank][peer];hi=lo+send[peer];peer_offset=0
-                map_lo=cursors[peer][rank];map_hi=map_lo+recv[peer];map_offset=0
-                for e in range(experts):
-                    length=recvs[peer][1+e]
-                    start=max(lo,peer_offset);end=min(hi,peer_offset+length)
-                    if start<end:
-                        # Full GEMM shapes and BF16 weight-gradient reductions
-                        # stay unchanged even when a bucket splits its output.
-                        while len(values)<=e:
-                            i=len(values)
-                            with stage('pipeline.expert_compute'):
-                                part=x[offsets[i]:offsets[i+1]]
-                                values.append(owner.experts[str(owner.first_expert_id+i)](part) if counts[i] else part.to(dtype))
-                        expert_start=sum(row[1+e] for row in recvs[:peer])+start-peer_offset
-                        parts.append(values[e][expert_start:expert_start+end-start])
-                    peer_offset+=length
-                    length=sends[peer][1+e]
-                    start=max(map_lo,map_offset);end=min(map_hi,map_offset+length)
-                    if start<end:
-                        map_start=send_offsets[e]+sum(row[1+e] for row in sends[:peer])+start-map_offset
-                        maps.append(send_perm[map_start:map_start+end-start])
-                    map_offset+=length
-            value=torch.cat(parts) if parts else x[:0].to(dtype)
+            with stage('pipeline.bucket_schedule'):
+                parts=[]
+                for peer in range(owner.ep_size):
+                    lo=cursors[rank][peer];hi=lo+send[peer];peer_offset=0
+                    map_lo=cursors[peer][rank];map_hi=map_lo+recv[peer];map_offset=0
+                    for e in range(experts):
+                        length=recvs[peer][1+e]
+                        start=max(lo,peer_offset);end=min(hi,peer_offset+length)
+                        if start<end:
+                            # Full GEMM shapes and BF16 weight-gradient reductions
+                            # stay unchanged even when a bucket splits its output.
+                            while len(values)<=e:
+                                i=len(values)
+                                with stage('pipeline.expert_compute'):
+                                    part=x[offsets[i]:offsets[i+1]]
+                                    values.append(owner.experts[str(owner.first_expert_id+i)](part) if counts[i] else part.to(dtype))
+                            expert_start=sum(row[1+e] for row in recvs[:peer])+start-peer_offset
+                            parts.append(values[e][expert_start:expert_start+end-start])
+                        peer_offset+=length
+                        length=sends[peer][1+e]
+                        start=max(map_lo,map_offset);end=min(map_hi,map_offset+length)
+                        if start<end:
+                            map_start=send_offsets[e]+sum(row[1+e] for row in sends[:peer])+start-map_offset
+                            maps.append(send_perm[map_start:map_start+end-start])
+                        map_offset+=length
+            with stage('pipeline.bucket_pack'):
+                value=torch.cat(parts) if parts else x[:0].to(dtype)
             sent.append(value);input_splits.append(send);output_splits.append(recv)
             actual=max(sum(send),sum(recv))*row_bytes
             assert actual<=self.return_bucket_bytes
@@ -214,13 +220,14 @@ class MiniMindEPRouting:
                 dist.all_to_all_single(returned,value.detach(),output_split_sizes=list(recv),
                     input_split_sizes=list(send),group=owner.process_group)
             returned.record_stream(compute);received.append(returned)
-        returned=_ExpertReturn.apply(owner.process_group,tuple(input_splits),tuple(output_splits),stream,tuple(received),*sent)
-        wire_perm=torch.cat(maps) if maps else send_perm[:0]
-        inverse=torch.empty_like(wire_perm)
-        inverse.scatter_(0,wire_perm,torch.arange(len(wire_perm),device=x.device,dtype=torch.int64))
-        compute.wait_stream(stream)
-        self.last_return_buckets=len(sent)
-        return torch.ops.my_cuda_ep.gather(torch.cat(returned),inverse)
+        with stage('pipeline.restore'):
+            returned=_ExpertReturn.apply(owner.process_group,tuple(input_splits),tuple(output_splits),stream,tuple(received),*sent)
+            wire_perm=torch.cat(maps) if maps else send_perm[:0]
+            inverse=torch.empty_like(wire_perm)
+            inverse.scatter_(0,wire_perm,torch.arange(len(wire_perm),device=x.device,dtype=torch.int64))
+            compute.wait_stream(stream)
+            self.last_return_buckets=len(sent)
+            return torch.ops.my_cuda_ep.gather(torch.cat(returned),inverse)
 
     @torch.compiler.disable(recursive=False)
     def __call__(self,owner,x,ids,weights,scores=None):
