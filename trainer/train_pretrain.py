@@ -8,6 +8,8 @@ import datasets  # noqa: F401  # Windows pyarrow/torch DLL conflict workaround (
 import argparse
 import json
 import time
+import hashlib
+import math
 import warnings
 import torch
 import torch.distributed as dist
@@ -26,10 +28,43 @@ from trainer.trainer_utils import (
 warnings.filterwarnings('ignore')
 
 
+def record_training_update(step, norm, res, started):
+    """Bounded comparisons use the same completed-update timing on all paths."""
+    torch.cuda.synchronize()
+    values = dict(step=step, update=len(measurement['updates'])+1,
+                  seconds=time.perf_counter()-started,
+                  loss=float(res.loss.detach()), aux_loss=float(res.aux_loss.detach()),
+                  grad_norm=float(norm), lr=optimizer.param_groups[0]['lr'],
+                  valid_tokens=measurement.pop('update_tokens', 0),
+                  peak_allocated=torch.cuda.max_memory_allocated(),
+                  peak_reserved=torch.cuda.max_memory_reserved())
+    if not all(math.isfinite(values[k]) for k in ('loss', 'aux_loss', 'grad_norm')):
+        raise RuntimeError(f'Non-finite training values: {values}')
+    if args.ep_routing != 'original' and ep_routing_controller.fallbacks:
+        raise RuntimeError('Optimized EP unexpectedly fell back')
+    measurement['updates'].append(values)
+    measurement['completed_steps']=step
+    if step == args.measure_warmup_steps:
+        measurement['warmup_peak_allocated']=values['peak_allocated']
+        measurement['warmup_peak_reserved']=values['peak_reserved']
+        torch.cuda.reset_peak_memory_stats()
+        measurement['measured_started']=time.perf_counter()
+    with open(os.path.join(args.save_dir, f'metrics_rank{dist.get_rank()}.jsonl'), 'a') as record:
+        record.write(json.dumps(values)+'\n')
+
+
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
     last_step = start_step
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
+        global_step=epoch*iters+step
+        if args.max_steps and (step-1) % args.accumulation_steps == 0:
+            update_started=time.perf_counter()
+        if args.max_steps:
+            if global_step > args.measure_warmup_steps:
+                measurement['input_hash'].update(input_ids.numpy().tobytes())
+                measurement['input_hash'].update(labels.numpy().tobytes())
+            measurement['update_tokens']=measurement.get('update_tokens',0)+int((labels[:,1:]!=-100).sum())
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
         last_step = step
@@ -37,28 +72,33 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        with autocast_ctx:
-            res = model(input_ids, labels=labels)
-            loss = res.loss + res.aux_loss
-            loss = loss / args.accumulation_steps
-
-        if args.ep_overlap_grad and (step % args.accumulation_steps == 0 or step == iters):
-            ep_gradient_sync.arm()
-        scaler.scale(loss).backward()
+        # Bounded comparisons synchronize both DDP and EP once per update.
+        # Keep the original unbounded entry's synchronization behavior unchanged.
+        sync_context=(model.no_sync() if args.max_steps and isinstance(model, DistributedDataParallel)
+                      and step % args.accumulation_steps != 0 and step != iters else nullcontext())
+        with sync_context:
+            with autocast_ctx:
+                res = model(input_ids, labels=labels)
+                loss = (res.loss + res.aux_loss) / args.accumulation_steps
+            if args.ep_overlap_grad and (step % args.accumulation_steps == 0 or step == iters):
+                ep_gradient_sync.arm()
+            scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0:
             if lm_config.use_ep:
                 sync_ep_gradients(model, bucket_bytes=args.ep_grad_bucket_mib * 1024 * 1024)
             scaler.unscale_(optimizer)
             if lm_config.use_ep:
-                clip_ep_grad_norm_(model, args.grad_clip)
+                norm=clip_ep_grad_norm_(model, args.grad_clip)
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                norm=torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             scaler.step(optimizer)
             scaler.update()
 
             optimizer.zero_grad(set_to_none=True)
+            if args.max_steps:
+                record_training_update(global_step, norm, res, update_started)
 
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
@@ -72,7 +112,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 Logger(f'Optimized EP calls: {ep_routing_controller.calls}, fallback: {ep_routing_controller.fallbacks}')
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
-        should_save = step % args.save_interval == 0 or step == iters
+        reached_limit=bool(args.max_steps and global_step >= args.max_steps)
+        should_save = step % args.save_interval == 0 or step == iters or reached_limit
         if should_save and (lm_config.use_ep or is_main_process()):
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
@@ -102,6 +143,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             model.train()
 
         del input_ids, labels, res, loss
+        if reached_limit:
+            break
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:
         if lm_config.use_ep:
@@ -114,6 +157,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
+    return last_step
 
 
 if __name__ == "__main__":
@@ -153,13 +197,30 @@ if __name__ == "__main__":
     parser.add_argument('--ep_overlap_grad',default=0,type=int,choices=[0,1],help='按梯度就绪事件与反向尾部重叠共享梯度归约')
     parser.add_argument('--ep_grad_bucket_mib',default=16,type=int,help='共享梯度通信桶容量 MiB')
     parser.add_argument('--ep_return_bucket_mib',default=16,type=int,help='专家回传通信桶容量 MiB')
+    parser.add_argument('--max_steps',type=int,default=0,help='Optional global microbatch step limit; 0 runs full epochs')
+    parser.add_argument('--measure_warmup_steps',type=int,default=0,help='Exclude these initial microbatch steps from bounded-run throughput')
+    parser.add_argument('--initial_checkpoint',default=None,help='Common FP32 random initialization for controlled comparisons')
+    parser.add_argument('--router_aux_loss_mode',choices=['legacy','local_topk_sum'],default='legacy')
     args = parser.parse_args()
     if min(args.ep_grad_bucket_mib,args.ep_return_bucket_mib)<=0:
         parser.error('EP bucket capacities must be positive')
 
+    if args.max_steps < 0 or args.measure_warmup_steps < 0:
+        parser.error('Step counts must be nonnegative')
+    if args.max_steps and (args.max_steps % args.accumulation_steps or
+            args.measure_warmup_steps % args.accumulation_steps or
+            args.measure_warmup_steps >= args.max_steps):
+        parser.error('Bounded step limits must contain complete updates and exceed warmup')
+    if args.max_steps and args.from_resume:
+        parser.error('Bounded comparisons start from a fresh optimizer')
+    if args.initial_checkpoint and (args.from_weight != 'none' or args.from_resume):
+        parser.error('Common initialization requires from_weight=none and from_resume=0')
+
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    if args.max_steps and (not dist.is_initialized() or 'cuda' not in args.device):
+        parser.error('Bounded comparisons require CUDA torchrun')
     if args.use_ep:
         if not dist.is_initialized() or dist.get_world_size() < 2:
             raise RuntimeError('--use_ep训练必须用torchrun启动，并且world_size至少为2')
@@ -179,6 +240,7 @@ if __name__ == "__main__":
         ep_comm_dtype=args.ep_comm_dtype,
         num_experts=args.num_experts,
         num_experts_per_tok=args.num_experts_per_tok,
+        router_aux_loss_mode=args.router_aux_loss_mode,
     )
     if is_main_process():
         with open(os.path.join(args.save_dir, 'training_config.json'), 'w') as record:
@@ -202,6 +264,11 @@ if __name__ == "__main__":
     
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    if args.initial_checkpoint:
+        initial=torch.load(args.initial_checkpoint,map_location='cpu',weights_only=True,mmap=True)
+        local_keys=set(model.state_dict())
+        model.load_state_dict({k:v for k,v in initial.items() if k in local_keys},strict=True)
+        del initial
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
@@ -244,6 +311,13 @@ if __name__ == "__main__":
     if dist.is_initialized() and not lm_config.use_ep:
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
+    measurement=None
+    if args.max_steps:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        measurement=dict(started=time.perf_counter(),measured_started=time.perf_counter(),
+                         updates=[],input_hash=hashlib.sha256(),completed_steps=0)
+    completed_epochs=0
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
@@ -253,10 +327,46 @@ if __name__ == "__main__":
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
         if skip > 0: 
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
+            last_step=train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
         else:
-            train_epoch(epoch, loader, len(loader), 0, wandb)
-    
+            last_step=train_epoch(epoch, loader, len(loader), 0, wandb)
+        completed_epochs=epoch+int(last_step==len(loader)+skip)
+        if args.max_steps and measurement['completed_steps'] >= args.max_steps:
+            break
+
+    if measurement is not None:
+        torch.cuda.synchronize()
+        rows=measurement['updates'];measured=[r for r in rows if r['step']>args.measure_warmup_steps]
+        expected=args.max_steps//args.accumulation_steps
+        if len(rows)!=expected or measurement['completed_steps']!=args.max_steps:
+            raise RuntimeError(f'Incomplete comparison: {len(rows)} of {expected} optimizer updates')
+        payload=dict(rank=dist.get_rank(),completed_steps=measurement['completed_steps'],
+            optimizer_updates=len(rows),measured_updates=len(measured),warmup_steps=args.measure_warmup_steps,
+            total_seconds=time.perf_counter()-measurement['started'],
+            measured_seconds=time.perf_counter()-measurement['measured_started'],
+            valid_tokens=sum(r['valid_tokens'] for r in measured),updates=rows,
+            input_sha256=measurement['input_hash'].hexdigest(),finite=True,
+            fallback_count=ep_routing_controller.fallbacks if args.ep_routing!='original' else 0,
+            peak_allocated=torch.cuda.max_memory_allocated(),peak_reserved=torch.cuda.max_memory_reserved(),
+            warmup_peak_allocated=measurement.get('warmup_peak_allocated',0),
+            precision='FP32 parameters / AdamW state, BF16 autocast',compiled=bool(args.use_compile),
+            auxiliary_contract=args.router_aux_loss_mode,completed_epochs=completed_epochs,
+            loss_sampling='last microbatch of each optimizer update',
+            timing='Normal trainer: includes data loading, scheduled LR, logging and checkpoints; same CUDA completion boundary per update')
+        gathered=[None]*dist.get_world_size()
+        dist.all_gather_object(gathered,payload)
+        if is_main_process():
+            seconds=max(r['measured_seconds'] for r in gathered)
+            result=dict(passed=True,ranks=gathered,
+                valid_tokens_per_second=sum(r['valid_tokens'] for r in gathered)/seconds,
+                optimizer_update_seconds=seconds/len(measured),
+                total_seconds=max(r['total_seconds'] for r in gathered),
+                peak_allocated=max(r['peak_allocated'] for r in gathered),
+                peak_reserved=max(r['peak_reserved'] for r in gathered))
+            with open(os.path.join(args.save_dir,'training_measurement.json'),'w') as record:
+                json.dump(result,record,indent=2)
+            Logger(f"BOUNDED TRAINING PASSED: {len(rows)} updates, {len(measured)} measured, {result['valid_tokens_per_second']:.2f} valid Token/s")
+
     # ========== 9. 清理分布进程 ==========
     if args.ep_routing != 'original':
         summary = dict(rank=dist.get_rank(), optimized_ep_calls=ep_routing_controller.calls,
@@ -270,7 +380,7 @@ if __name__ == "__main__":
         dist.gather_object(summary, summaries, dst=0)
         if is_main_process():
             with open(os.path.join(args.save_dir, 'training_summary.json'), 'w') as record:
-                json.dump(dict(completed_epochs=args.epochs, ranks=summaries), record, indent=2)
+                json.dump(dict(completed_epochs=completed_epochs, ranks=summaries), record, indent=2)
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
