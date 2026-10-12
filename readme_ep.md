@@ -19,7 +19,7 @@
 
 计数交换附带完整专家分配数，直接推导本地专家切片，省掉专家分组后的 CPU 读数；计数异步复制到可复用的固定页缓冲，与打包重叠。仍需在使用动态 NCCL splits 前等待对应 Event，这不是完全无 CPU 同步的路径。
 
-可选的按专家回传流水保留每个专家完整的 GEMM 形状及行顺序，让已完成专家的输出回传与后续专家计算重叠。反向用单一 autograd 节点固定各 Rank 的通信顺序，本轮反向仍串行。因未取得额外端到端收益，流水默认关闭。
+可选回传流水保留每个专家完整的 GEMM 形状及行顺序，按通信桶发送已完成的专家输出，与后续专家计算重叠。桶边界由全局计数统一决定，同时限制各 Rank 的发送和接收量；专家输出超桶时只切分通信，不切分 GEMM。反向用单一 autograd 节点固定各 Rank 的通信顺序，本轮反向仍串行。因未取得额外端到端收益，流水默认关闭。
 
 ## 安装优化路由依赖
 
@@ -55,9 +55,9 @@ python -m torch.distributed.run --standalone --nproc_per_node=2 train_pretrain.p
 
 调整专家数 / Top-K 使用对应参数；Top-K 大于 2 时选择 `compact`。全量微调沿用 `trainer/train_full_sft.py --use_ep` 的原生 EP 支持。模型 compile 使用原 `--use_compile` 开关；动态 splits 和专家空分支存在编译边界，不能将其称为完整 EP 的 fullgraph 捕获。
 
-优化预训练默认 `--ep_async_counts 1 --ep_pipelined_return 0`。测试按专家回传流水时显式指定 `--ep_pipelined_return 1`；各 Rank 的开关必须一致。
+优化预训练默认 `--ep_async_counts 1 --ep_pipelined_return 0`。测试回传桶流水时显式指定 `--ep_pipelined_return 1 --ep_return_bucket_mib 16`；各 Rank 的开关、桶容量和精度必须一致。输出按实际行数发送，不传 padding；4/8/12/16 MiB 容量扫描用于选择当前配置的容量。
 
-训练在优化器更新时同步共享参数梯度：按设备和 dtype 分组，以 16 MiB 为桶容量合并 All-Reduce，超大参数单独通信；本地专家梯度只除以 EP Rank 数。全局裁剪批量计算 FP32 范数并缩放梯度，共享参数计一份、专家参数计入各 Rank 的分片。归约顺序可能带来 FP32 末位差异，专家计算与 BF16 autocast 规则保持原样。
+训练在优化器更新时同步共享参数梯度：按设备和 dtype 分组，以 `--ep_grad_bucket_mib 16` 为默认桶容量合并 All-Reduce，超大参数单独通信；本地专家梯度只除以 EP Rank 数。全局裁剪批量计算 FP32 范数并缩放梯度，共享参数计一份、专家参数计入各 Rank 的分片。归约顺序可能带来 FP32 末位差异，专家计算与 BF16 autocast 规则保持原样。
 
 保存完整 MoE 权重，同时为各 Rank 保存独立前缀的恢复状态；续训须匹配专家数、Top-K 和 EP 拓扑。优化训练条件不满足时显式报错，禁止静默回退。
 
@@ -77,7 +77,8 @@ CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.run --standalone --nproc_pe
 from model.ep_routing_backend import attach_ep_routing
 
 controller = attach_ep_routing(model, mode="compact", async_counts=True,
-                               pipelined_return=False)  # Top-2 也可选 dedup_train
+                               pipelined_return=False, return_bucket_bytes=16*1024**2)
+# Top-2 也可选 dedup_train；启用回传桶时 pipelined_return=True。
 # 推理使用 model.eval()、torch.inference_mode() 和所需的 autocast。
 # 训练使用正常的 autograd；CUDA 算子已注册反向。
 controller.uninstall()
@@ -114,4 +115,4 @@ EP 吞吐约为 DDP 的 **99.85%**，峰值 allocated 降低 **23.75%**，主要
 
 计数 / 回传优化验收：每 Rank 12 类路由边界 × 6 条参考与候选路径通过，含空专家、空来源和不等长输入；6 专家 Top-1/2/3/6 的全模型、BF16 值 / 梯度、推理到训练切换共 164 项检查通过。三种 EP 与 DDP 分别通过 FP32 梯度及两次 AdamW 更新对照；12 个 BF16 性能窗口均有限、零回退、选定 GPU 无外部任务混入。单独 profiler 确认前向专家 GEMM 与回传 NCCL 的区间重叠，反向及整体吞吐不据此推算。
 
-当前动态通信仍有 CPU 读取 counts 的同步；未实现通信与计算重叠。后续收益需在相同模型、数据、精度、损失及同步条件下重新验收。
+当前动态通信仍有 CPU 读取 counts 的同步；可选回传流水已验证前向通信与计算重叠，反向仍串行。后续收益需在相同模型、数据、精度、损失及同步条件下重新验收。

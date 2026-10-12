@@ -32,7 +32,7 @@ def native_experts(owner,x,counts):
 
 
 class _ExpertReturn(torch.autograd.Function):
-    """Attach one autograd node to prelaunched per-expert return exchanges.
+    """Attach one autograd node to prelaunched return bucket exchanges.
 
     A single backward node keeps collective order identical on every Rank,
     including when different experts are empty. Backward remains serialized.
@@ -57,13 +57,15 @@ class _ExpertReturn(torch.autograd.Function):
         return (None,)*5+tuple(grads)
 
 class MiniMindEPRouting:
-    def __init__(self,model,library,mode='compact',async_counts=True,pipelined_return=False):
+    def __init__(self,model,library,mode='compact',async_counts=True,pipelined_return=False,return_bucket_bytes=16*1024*1024):
         if mode not in ('compact','dedup_train'): raise ValueError('supported modes: compact, dedup_train')
         from my_cuda_kernels.ep_ops import load_library
         load_library(library)
         self.mode=mode;self.enabled=True;self.workspaces={};self.scratch_spaces={};self.calls=0;self.fallbacks=0;self.transport_rows=0;self.original_transport_rows=0
+        if return_bucket_bytes<=0:raise ValueError("return bucket size must be positive")
+        self.return_bucket_bytes=return_bucket_bytes
         self.async_counts=async_counts;self.pipelined_return=pipelined_return
-        self.streams={};self.host_counts={}
+        self.streams={};self.host_counts={};self.return_calls=0;self.max_return_bytes=0
         self.layers=[layer.mlp for layer in model.model.layers]
         for i,mlp in enumerate(self.layers):
             if not hasattr(mlp,'local_expert_ids'):raise ValueError('EP model required')
@@ -107,55 +109,125 @@ class MiniMindEPRouting:
         return torch.cat((wire_counts[:,None],per_expert.view(owner.ep_size,owner.experts_per_rank)),dim=1)
 
     def exchange_counts(self,owner,x,table):
-        received=torch.empty_like(table)
-        if not self.async_counts:
+        # Only the pipeline gathers global counts so bucket boundaries agree.
+        shape=(owner.ep_size,*table.shape) if self.pipelined_return else (2,*table.shape)
+        received=table.new_empty(shape) if self.pipelined_return else torch.empty_like(table)
+        def exchange():
+            if self.pipelined_return:
+                dist.all_gather_into_tensor(received.flatten(0,1),table,group=owner.process_group)
+                return received
             dist.all_to_all_single(received,table,group=owner.process_group)
-            return table,received,None
+            return torch.stack((table,received))
+        rank=dist.get_rank(owner.process_group)
+        if not self.async_counts:return exchange(),None,rank
         stream=self.comm_stream(x);stream.wait_stream(torch.cuda.current_stream(x.device))
-        key=(x.device,torch.cuda.current_stream(x.device).cuda_stream,tuple(table.shape))
+        key=(x.device,torch.cuda.current_stream(x.device).cuda_stream,shape,self.pipelined_return)
         if key not in self.host_counts:
-            # A reusable buffer must remain writable after eval -> train.
             with torch.inference_mode(False):
-                self.host_counts[key]=torch.empty((2,*table.shape),dtype=torch.int64,pin_memory=True)
+                self.host_counts[key]=torch.empty(shape,dtype=torch.int64,pin_memory=True)
         host=self.host_counts[key]
         with torch.cuda.stream(stream):
-            table.record_stream(stream)
-            dist.all_to_all_single(received,table,group=owner.process_group)
-            host.copy_(torch.stack((table,received)),non_blocking=True)
+            table.record_stream(stream);received.record_stream(stream)
+            host.copy_(exchange(),non_blocking=True)
             ready=torch.cuda.Event();ready.record(stream)
-        return table,received,(host,ready)
+        return host,ready,rank
 
     def read_counts(self,transfer):
-        table,received,ticket=transfer
-        if ticket is None:return table.tolist(),received.tolist()
-        host,ready=ticket;ready.synchronize()
-        return host[0].tolist(),host[1].tolist()
+        table,ready,rank=transfer
+        if ready is not None:ready.synchronize()
+        rows=table.tolist()
+        if self.pipelined_return:return rows[rank],[source[rank] for source in rows],rows
+        return rows[0],rows[1],None
 
-    def return_experts(self,owner,x,counts,sends,recvs,send_inverse):
-        """Keep full expert GEMMs; overlap earlier returns with later experts."""
+    def return_groups(self,global_tables,row_bytes):
+        experts=len(global_tables[0][0])-1;ranks=len(global_tables)
+        loads=[[sum(source[r][1+e] for source in global_tables) for e in range(experts)] for r in range(ranks)]
+        groups=[];begin=0;totals=[0]*ranks
+        for e in range(experts):
+            added=[totals[r]+loads[r][e] for r in range(ranks)]
+            if e>begin and max(added)*row_bytes>self.return_bucket_bytes:
+                groups.append((begin,e));begin=e;totals=[0]*ranks
+            totals=[totals[r]+loads[r][e] for r in range(ranks)]
+        return groups+[(begin,experts)]
+
+    def return_experts(self,owner,x,counts,sends,recvs,send_perm,global_tables):
+        """Bucket consecutive full experts, then wire rows peer-major.
+
+        Keep full expert GEMMs; split only wire payloads exceeding capacity.
+        All ranks derive the same boundaries from the global count table.
+        """
         stream=self.comm_stream(x);compute=torch.cuda.current_stream(x.device)
-        sent=[];received=[];events=[];input_splits=[];output_splits=[];offset=0
-        output_dtype=torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else x.dtype
-        for local_id,count in enumerate(counts):
-            with stage('pipeline.expert_compute'):
-                part=x[offset:offset+count]
-                value=owner.experts[str(owner.first_expert_id+local_id)](part) if count else part.to(output_dtype)
-            offset+=count;sent.append(value)
-            send=tuple(row[1+local_id] for row in recvs)
-            recv=tuple(row[1+local_id] for row in sends)
-            input_splits.append(send);output_splits.append(recv)
-            stream.wait_stream(compute)
-            with torch.cuda.stream(stream),stage('pipeline.return_async'):
-                value.record_stream(stream)
-                returned=value.new_empty((sum(recv),value.shape[1]))
-                dist.all_to_all_single(returned,value.detach().contiguous(),
-                    output_split_sizes=list(recv),input_split_sizes=list(send),group=owner.process_group)
-                ready=torch.cuda.Event();ready.record(stream)
-            returned.record_stream(compute);received.append(returned);events.append(ready)
+        sent=[];received=[];events=[];input_splits=[];output_splits=[];maps=[];offset=0
+        dtype=torch.get_autocast_dtype('cuda') if torch.is_autocast_enabled('cuda') else x.dtype
+        groups=self.return_groups(global_tables,x.shape[1]*torch.empty((),dtype=dtype).element_size())
+        send_offsets=[0]
+        for e in range(owner.experts_per_rank):send_offsets.append(send_offsets[-1]+sum(row[1+e] for row in sends))
+        for begin,end in groups:
+            values=[]
+            for e in range(begin,end):
+                count=counts[e]
+                with stage('pipeline.expert_compute'):
+                    part=x[offset:offset+count]
+                    values.append(owner.experts[str(owner.first_expert_id+e)](part) if count else part.to(dtype))
+                offset+=count
+            # Stable expert layout is expert -> source rank. NCCL needs
+            # source rank -> expert within a bucket; copy without rounding.
+            pieces=[];peer_maps=[]
+            for peer in range(owner.ep_size):
+                mapping=[]
+                for e in range(begin,end):
+                    start=sum(row[1+e] for row in recvs[:peer]);length=recvs[peer][1+e]
+                    pieces.append(values[e-begin][start:start+length])
+                    start=send_offsets[e]+sum(row[1+e] for row in sends[:peer]);length=sends[peer][1+e]
+                    mapping.append(send_perm[start:start+length])
+                peer_maps.append(torch.cat(mapping))
+            wire=torch.cat(pieces)
+            row_bytes=x.shape[1]*wire.element_size();capacity=self.return_bucket_bytes//row_bytes
+            if capacity<1:raise ValueError('return bucket must fit one output row')
+            # Matrix: expert-owner rank -> original token rank. Fill globally
+            # agreed buckets with both send and receive capped on every rank.
+            remaining=[[sum(global_tables[peer][r][1+begin:1+end]) for peer in range(owner.ep_size)] for r in range(owner.ep_size)]
+            cursors=[[0]*owner.ep_size for _ in range(owner.ep_size)]
+            peer_lengths=[sum(row[1+begin:1+end]) for row in recvs]
+            peer_offsets=[0]
+            for length in peer_lengths:peer_offsets.append(peer_offsets[-1]+length)
+            rank=dist.get_rank(owner.process_group);first=True
+            while first or any(any(row) for row in remaining):
+                first=False;send_room=[capacity]*owner.ep_size;recv_room=[capacity]*owner.ep_size
+                bucket=[[0]*owner.ep_size for _ in range(owner.ep_size)]
+                for source in range(owner.ep_size):
+                    for peer in range(owner.ep_size):
+                        count=min(remaining[source][peer],send_room[source],recv_room[peer])
+                        bucket[source][peer]=count;remaining[source][peer]-=count
+                        send_room[source]-=count;recv_room[peer]-=count
+                send=bucket[rank];recv=[bucket[peer][rank] for peer in range(owner.ep_size)]
+                chunks=[]
+                for peer in range(owner.ep_size):
+                    start=peer_offsets[peer]+cursors[rank][peer]
+                    chunks.append(wire[start:start+send[peer]])
+                    start=cursors[peer][rank]
+                    maps.append(peer_maps[peer][start:start+recv[peer]])
+                value=torch.cat(chunks);sent.append(value)
+                for source in range(owner.ep_size):
+                    for peer in range(owner.ep_size):cursors[source][peer]+=bucket[source][peer]
+                actual=max(sum(send),sum(recv))*row_bytes
+                assert actual<=self.return_bucket_bytes
+                self.max_return_bytes=max(self.max_return_bytes,actual);self.return_calls+=1
+                input_splits.append(tuple(send));output_splits.append(tuple(recv))
+                stream.wait_stream(compute)
+                with torch.cuda.stream(stream),stage('pipeline.return_async'):
+                    value.record_stream(stream)
+                    returned=value.new_empty((sum(recv),value.shape[1]))
+                    dist.all_to_all_single(returned,value.detach(),output_split_sizes=recv,
+                        input_split_sizes=send,group=owner.process_group)
+                    ready=torch.cuda.Event();ready.record(stream)
+                returned.record_stream(compute);received.append(returned);events.append(ready)
         returned=_ExpertReturn.apply(owner.process_group,tuple(input_splits),tuple(output_splits),stream,tuple(received),*sent)
+        wire_perm=torch.cat(maps);inverse=torch.empty_like(wire_perm)
+        inverse.scatter_(0,wire_perm,torch.arange(len(wire_perm),device=x.device,dtype=torch.int64))
         for ready in events:compute.wait_event(ready)
-        # Per-expert outputs contain source-rank-major rows, as in stable layout.
-        return torch.ops.my_cuda_ep.gather(torch.cat(returned),send_inverse)
+        self.last_return_buckets=len(sent)
+        return torch.ops.my_cuda_ep.gather(torch.cat(returned),inverse)
 
     @torch.compiler.disable(recursive=False)
     def __call__(self,owner,x,ids,weights,scores=None):
@@ -171,7 +243,7 @@ class MiniMindEPRouting:
             table=self.count_table(owner,flat_ids,send_counts)
             transfer=self.exchange_counts(owner,x,table)
         if self.pipelined_return:
-            _,send_inverse,_=ws.partition(flat_ids[perm]%owner.experts_per_rank,1,'return_map',owner.experts_per_rank)
+            send_perm,_,_=ws.partition(flat_ids[perm]%owner.experts_per_rank,1,'return_map',owner.experts_per_rank)
         with stage('pack'):
             if owner.training:
                 send,send_ids=torch.ops.my_cuda_ep.pack(x,flat_ids,perm,inverse,topk,owner.experts_per_rank)
@@ -180,7 +252,7 @@ class MiniMindEPRouting:
                 send_ids=ws.get('send_ids',(n,),torch.int64,device)
                 torch.ops.my_cuda_ep.pack_out(x,flat_ids,perm,topk,owner.experts_per_rank,send,send_ids)
         with stage('host_splits'):
-            sends,recvs=self.read_counts(transfer)
+            sends,recvs,global_tables=self.read_counts(transfer)
             send_splits=tuple(row[0] for row in sends);recv_splits=tuple(row[0] for row in recvs);r=sum(recv_splits)
             local_counts=tuple(sum(row[1+e] for row in recvs) for e in range(owner.experts_per_rank))
         with stage('dispatch'):
@@ -200,7 +272,7 @@ class MiniMindEPRouting:
                 torch.ops.my_cuda_ep.gather_out(recv,ep_perm,sorted_x)
         handle=RoutingHandle(inverse,ep_inverse,send_splits,recv_splits)
         if self.pipelined_return:
-            returned=self.return_experts(owner,sorted_x,local_counts,sends,recvs,send_inverse)
+            returned=self.return_experts(owner,sorted_x,local_counts,sends,recvs,send_perm,global_tables)
         else:
             with stage('experts'):sorted_y=native_experts(owner,sorted_x,local_counts)
             with stage('return'):
@@ -241,11 +313,11 @@ class MiniMindEPRouting:
             table=self.count_table(owner,flat_ids,unique_counts)
             transfer=self.exchange_counts(owner,x,table)
         if self.pipelined_return:
-            _,send_inverse,_=ws.partition(flat_ids[perm]%experts,1,'return_map',experts)
+            send_perm,_,_=ws.partition(flat_ids[perm]%experts,1,'return_map',experts)
         with stage('pack'):
             send,metadata,_=torch.ops.my_cuda_ep.dedup_pack(x,flat_ids,perm,flags,prefix,experts,bits)
         with stage('host_splits'):
-            sends,recvs=self.read_counts(transfer)
+            sends,recvs,global_tables=self.read_counts(transfer)
             send_unique=tuple(v[0] for v in sends);recv_unique=tuple(v[0] for v in recvs)
             send_expanded=tuple(sum(v[1:]) for v in sends);recv_expanded=tuple(sum(v[1:]) for v in recvs)
             total_send=sum(send_unique);total_recv=sum(recv_unique);expanded=sum(recv_expanded)
@@ -264,7 +336,7 @@ class MiniMindEPRouting:
             sorted_x=torch.ops.my_cuda_ep.expand(recv,wire[ep_perm])
         handle=RoutingHandle(inverse,ep_inverse,send_expanded,recv_expanded)
         if self.pipelined_return:
-            returned=self.return_experts(owner,sorted_x,local_counts,sends,recvs,send_inverse)
+            returned=self.return_experts(owner,sorted_x,local_counts,sends,recvs,send_perm,global_tables)
         else:
             with stage('experts'):sorted_y=native_experts(owner,sorted_x,local_counts)
             with stage('return'):
@@ -283,6 +355,6 @@ class MiniMindEPRouting:
         self.workspaces.clear();self.scratch_spaces.clear();self.streams.clear();self.host_counts.clear()
 
 
-def attach_ep_routing(model, *, library=None, mode='compact',async_counts=True,pipelined_return=False):
+def attach_ep_routing(model, *, library=None, mode='compact',async_counts=True,pipelined_return=False,return_bucket_bytes=16*1024*1024):
     """Attach optimized routing without changing native expert computation."""
-    return MiniMindEPRouting(model, library, mode,async_counts,pipelined_return)
+    return MiniMindEPRouting(model, library, mode,async_counts,pipelined_return,return_bucket_bytes)

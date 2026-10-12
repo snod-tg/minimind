@@ -46,7 +46,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         if step % args.accumulation_steps == 0:
             if lm_config.use_ep:
-                sync_ep_gradients(model)
+                sync_ep_gradients(model, bucket_bytes=args.ep_grad_bucket_mib * 1024 * 1024)
             scaler.unscale_(optimizer)
             if lm_config.use_ep:
                 clip_ep_grad_norm_(model, args.grad_clip)
@@ -103,7 +103,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:
         if lm_config.use_ep:
-            sync_ep_gradients(model)
+            sync_ep_gradients(model, bucket_bytes=args.ep_grad_bucket_mib * 1024 * 1024)
         scaler.unscale_(optimizer)
         if lm_config.use_ep:
             clip_ep_grad_norm_(model, args.grad_clip)
@@ -148,7 +148,11 @@ if __name__ == "__main__":
     parser.add_argument('--ep_routing_library', default=None, help='built my_cuda_ep.so')
     parser.add_argument('--ep_async_counts',default=1,type=int,choices=[0,1],help='异步读取完整专家计数')
     parser.add_argument('--ep_pipelined_return',default=0,type=int,choices=[0,1],help='按完整专家流水回传；先用于 Prefill 验证')
+    parser.add_argument('--ep_grad_bucket_mib',default=16,type=int,help='共享梯度通信桶容量 MiB')
+    parser.add_argument('--ep_return_bucket_mib',default=16,type=int,help='专家回传通信桶容量 MiB')
     args = parser.parse_args()
+    if min(args.ep_grad_bucket_mib,args.ep_return_bucket_mib)<=0:
+        parser.error('EP bucket capacities must be positive')
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
@@ -206,7 +210,7 @@ if __name__ == "__main__":
         from model.ep_routing_backend import attach_ep_routing
         ep_routing_controller = attach_ep_routing(model, library=args.ep_routing_library,
             mode=args.ep_routing,async_counts=bool(args.ep_async_counts),
-            pipelined_return=bool(args.ep_pipelined_return))
+            pipelined_return=bool(args.ep_pipelined_return),return_bucket_bytes=args.ep_return_bucket_mib*1024*1024)
         Logger('Optimized EP routing enabled for training; native PyTorch experts')
 
     # ========== 6. 从ckp恢复状态 ==========
@@ -251,6 +255,7 @@ if __name__ == "__main__":
         summary = dict(rank=dist.get_rank(), optimized_ep_calls=ep_routing_controller.calls,
                        async_counts=ep_routing_controller.async_counts,
                        pipelined_return=ep_routing_controller.pipelined_return,
+                       return_bucket_mib=args.ep_return_bucket_mib,grad_bucket_mib=args.ep_grad_bucket_mib,
                        routing_fallbacks=ep_routing_controller.fallbacks,
                        peak_memory_bytes=torch.cuda.max_memory_allocated())
         summaries = [None] * dist.get_world_size() if is_main_process() else None

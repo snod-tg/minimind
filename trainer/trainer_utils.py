@@ -80,13 +80,14 @@ def sync_ep_shared_parameters(model, group=None):
 
 
 @torch.no_grad()
-def sync_ep_gradients(model, group=None):
+def sync_ep_gradients(model, group=None, bucket_bytes=16 * 1024 * 1024):
     """分桶同步共享梯度；本地 Expert 梯度只做全局平均。"""
     if not getattr(model.config, 'use_ep', False):
         return
     group = group if group is not None else dist.group.WORLD
     world_size = dist.get_world_size(group)
-    bucket_bytes = 16 * 1024 * 1024
+    if bucket_bytes <= 0:
+        raise ValueError("gradient bucket size must be positive")
 
     def reduce_bucket(grads):
         # 大参数单独通信，避免额外复制整个 embedding / head。
