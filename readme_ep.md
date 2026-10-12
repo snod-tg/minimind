@@ -45,8 +45,8 @@ cd trainer
 CUDA_VISIBLE_DEVICES=2,3 OMP_NUM_THREADS=1 TORCHINDUCTOR_COMPILE_THREADS=1 \
 python -m torch.distributed.run --standalone --nproc_per_node=2 train_pretrain.py \
   --use_ep --num_experts 6 --num_experts_per_tok 2 \
-  --ep_comm_dtype native --ep_routing dedup_train --use_compile 1 \
-  --ep_pipelined_return 1 --ep_overlap_grad 1 \
+  --ep_comm_dtype native --ep_routing dedup_train --use_compile 0 \
+  --ep_pipelined_return 1 --ep_overlap_grad 0 \
   --from_weight none --from_resume 0 \
   --save_weight pretrain_ep6_top2_new \
   --save_dir ../out/ep6_top2_new --checkpoint_dir ../checkpoints/ep6_top2_new
@@ -56,7 +56,7 @@ python -m torch.distributed.run --standalone --nproc_per_node=2 train_pretrain.p
 
 调整专家数 / Top-K 使用对应参数；Top-K 大于 2 时选择 `compact`。全量微调沿用 `trainer/train_full_sft.py --use_ep` 的原生 EP 支持。模型 compile 使用原 `--use_compile` 开关；动态 splits 和专家空分支存在编译边界，不能将其称为完整 EP 的 fullgraph 捕获。
 
-优化预训练默认 `--ep_async_counts 1 --ep_pipelined_return 0 --ep_overlap_grad 0`。测试完整更新重叠时显式指定 `--ep_pipelined_return 1 --ep_return_bucket_mib 16 --ep_overlap_grad 1`；各 Rank 的开关、桶容量和精度必须一致。输出按实际行数发送，不传 padding。
+优化预训练默认 `--ep_async_counts 1 --ep_pipelined_return 0 --ep_overlap_grad 0`。本轮实测推荐显式指定 `--ep_pipelined_return 1 --ep_return_bucket_mib 16 --ep_overlap_grad 0`；各 Rank 的开关、桶容量和精度必须一致。输出按实际行数发送，不传 padding。
 
 训练在优化器更新时同步共享参数梯度：按设备和 dtype 分组，以 `--ep_grad_bucket_mib 16` 为默认桶容量合并 All-Reduce，超大参数单独通信；本地专家梯度只除以 EP Rank 数。全局裁剪批量计算 FP32 范数并缩放梯度，共享参数计一份、专家参数计入各 Rank 的分片。归约顺序可能带来 FP32 末位差异，专家计算与 BF16 autocast 规则保持原样。
 
@@ -91,25 +91,29 @@ controller.uninstall()
 
 ## 基础版与最优版对比
 
-基础版为当前代码的无 EP DDP 路径；默认非 EP 的输出、损失和梯度另与首次 EP 提交前的 `89d674b` 验证一致。最优版指本轮已测 EP 配置中中位吞吐最高的组合：Top-2 按 Rank 去重、异步完整计数、前向与反向回传流水、共享梯度重叠。对应 `--ep_routing dedup_train --ep_async_counts 1 --ep_pipelined_return 1 --ep_overlap_grad 1`，回传和梯度桶均为 16 MiB。
+基础版为当前代码的无 EP DDP 路径；非 EP 模型的输出、损失和梯度另与首次 EP 提交前的 `89d674b` 验证一致。本轮优化 EP 采用 Top-2 按 Rank 去重、异步完整计数及前向/反向专家回传流水；关闭收益尚不稳定的共享梯度尾部重叠。对应 `--ep_routing dedup_train --ep_async_counts 1 --ep_pipelined_return 1 --ep_overlap_grad 0`，回传和梯度桶均为 16 MiB。
 
-两张驱动报告为 RTX 4080 的 SM89 GPU，双向 CUDA P2P 不可用；Python 3.12.3、PyTorch 2.9.0+cu128。hidden=768、8 层、6 专家 Top-2，每 Rank batch=32、seq=340、梯度累积=8；FP32 参数与 AdamW 状态、BF16 autocast、原 PyTorch 专家，裁剪阈值 1。
+2026-10-12 在双 RTX 4090D 上使用正式预训练入口比较两版，并各自开启、关闭 compile。hidden=768、8 层、6 专家 Top-2，每 Rank batch=32、seq=340、梯度累积=8；FP32 参数与 AdamW 状态、BF16 autocast、原 PyTorch 专家。Python 3.13.5、PyTorch 2.9.0+cu128、CUDA Toolkit 12.4、GCC 12。
 
-两版使用同初值、同输入，固定学习率 5e-4，辅助损失统一为 `local_topk_sum`，关闭 compile / profiler。每轮预热 4 次、测量 8 次完整更新，共 3 轮；每次更新包括数据加载、前向、反向、梯度同步、裁剪和 AdamW。吞吐统计有效移位标签 Token；吞吐和更新时间分别取中位数，显存取测量窗口跨 Rank / 轮次最大值。
+四组共用 FP32 随机初值、逐 Rank 数据顺序与原非 EP 的 `local_topk_sum` 辅助损失，每次优化器更新同步一次梯度。沿用原两轮 cosine 学习率调度，初始学习率 5e-4。每组 25 次预热更新加 500 次记录更新，共 4200 microbatch steps；每 1000 steps 及终点保存。表中吞吐与平均更新耗时按预热后整个端到端窗口计算，包含数据加载、前后向、梯度同步、裁剪、AdamW、日志和保存；显存为记录窗口跨 Rank 最大值。
 
 | 方案 | 有效 Token/s | 秒 / 更新 | 峰值 allocated / Rank | 峰值 reserved / Rank |
 |---|---:|---:|---:|---:|
-| 基础版：无 EP DDP | 61,419 | 1.7345 | 13.313 GiB | 14.564 GiB |
-| 最优版：优化 EP | 52,371 | 2.0337 | 10.620 GiB | 14.131 GiB |
+| 基础版：DDP eager | 71,254 | 1.5008 | 13.386 GiB | 14.344 GiB |
+| 基础版：DDP compile | 61,449 | 1.7403 | 10.843 GiB | 11.568 GiB |
+| 优化版：EP eager | 72,413 | 1.4768 | 10.554 GiB | 14.031 GiB |
+| 优化版：EP compile | 59,497 | 1.7974 | 8.080 GiB | 11.107 GiB |
 
-最优 EP 达到基础版吞吐的 **85.27%**，峰值 allocated 降低 **20.23%**。本轮结果体现了显存节省，尚未实现相对 DDP 的训练加速；“最优”仅限定为本轮已测 EP 配置。
+本轮四组中 EP eager 吞吐最高，相对 DDP eager 提高 **1.63%**，峰值 allocated 降低 **21.16%**；reserved 降幅较小，不能将 allocated 的降幅解释为全部显存预留量的降幅。每组启动到退出耗时依次为 **13.36 / 16.39 / 13.22 / 18.02 分钟**，包含初始化、数据准备、预热、编译及训练保存。
 
-![基础版与最优版训练对比](images/ep_overlap_training.png)
+compile 在两版中均降低 allocated，但端到端吞吐下降；EP compile 相对 DDP compile 的 allocated 降低 **25.47%**。当前性能选择为 EP eager，compile 保留为可选配置。EP 动态 counts 仍有 graph break，专家计算可编译，整个 EP 并非 fullgraph。
 
-这是关闭 compile 的短训练窗口，排除初始化、预热和保存；正式入口的辅助损失默认值、学习率调度与本测试不同。compile 正确性验证通过不代表正式 compile 训练性能已经验收，以上结果不能直接换算为完整两轮预训练耗时。
+![基础版与优化版的500次更新对比](images/ep_overlap_training.png)
+
+这是每组 500 次记录更新的一次运行，**1.63% 的吞吐差异尚未通过多轮重复证明稳定**；结果适用于当前硬件与配置，不能直接外推完整两轮训练时间或其他专家规模，也未验证训练后模型质量。四组都从相同初值独立训练，未覆盖此前训练模型。
 
 ## 验证与限制
 
-最终版本本地 22 项检查通过；双卡每 Rank 24 项梯度契约、12 类路由边界及 Top-1/2/3/6 的 82 项配置检查通过。专家 fullgraph、整模型允许动态边界的 compile 模式下，Top-2 每 Rank 25 项检查通过。FP32 两层模型同步梯度最大差 2.2352e-8，两次 AdamW 后参数最大差 2.9404e-6，沿用原误差阈值。性能测量输入一致，loss / 梯度范数有限、优化 EP 零回退，GPU 无其他任务混入。
+本轮本地 24 项 CPU 检查通过，服务器同步阶段 23 项检查通过；四种小模型训练入口和四组 500 次记录更新均成功退出，逐 Rank 输入哈希一致、loss / 梯度范数有限、优化 EP 零回退。此前双卡数值与边界验收：双卡每 Rank 24 项梯度契约、12 类路由边界及 Top-1/2/3/6 的 82 项配置检查通过。专家 fullgraph、整模型允许动态边界的 compile 模式下，Top-2 每 Rank 25 项检查通过。FP32 两层模型同步梯度最大差 2.2352e-8，两次 AdamW 后参数最大差 2.9404e-6，沿用原误差阈值。性能测量输入一致，loss / 梯度范数有限、优化 EP 零回退，GPU 无其他任务混入。
 
-动态计数仍有 CPU 等待，派发及输入梯度回传也存在计算依赖，尚未完全隐藏整步通信。共享梯度重叠保持显式可选；训练全局默认仍为回传流水 0、梯度重叠 0，表中的最优版须使用上文列出的开关。当前结果未验证完整训练后的模型质量。
+动态计数仍有 CPU 等待，派发及输入梯度回传也存在计算依赖，尚未完全隐藏整步通信。共享梯度重叠保持显式可选；训练全局默认仍为回传流水 0、梯度重叠 0，本轮优化版须使用上文列出的开关。当前结果未验证完整训练后的模型质量。
