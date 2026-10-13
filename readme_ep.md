@@ -23,7 +23,7 @@
 
 ## 安装优化路由依赖
 
-MiniMind 负责模型、NCCL 编排、梯度同步和模型保存；[my_cuda_kernels](https://github.com/snod-tg/fused_residual_rmsnorm_kernel) 提供通用 CUDA 打包、展开、合并及 autograd 算子。两项目通过 Python 包调用关联。
+MiniMind 负责模型、NCCL 编排、梯度同步和模型保存；[my_cuda_kernels](https://github.com/snod-tg/my_cuda_kernels) 提供通用 CUDA 打包、展开、合并及 autograd 算子。两项目通过 Python 包调用关联。
 
 在已具备 CUDA PyTorch 的环境中，进入算子项目构建：
 
